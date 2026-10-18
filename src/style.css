@@ -1,0 +1,47 @@
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  /* Black reads as the physical mirror; bright visuals drown out reflections. No chrome. */
+  background: #000000;
+}
+
+/* The webcam feed is a sensor, not a visual — never render it. */
+.camera-feed {
+  display: none;
+}
+
+/* Debug-only live preview, toggled by CAMERA.preview. Raw (unmirrored) so it lines up
+   with landmark coordinates. */
+.camera-feed--preview {
+  display: block;
+  position: fixed;
+  right: 1rem;
+  bottom: 1rem;
+  width: 320px;
+  height: auto;
+  border: 1px solid #7dffb0;
+  background: #000;
+  z-index: 10;
+}
+
+/* Temporary bring-up readout; deleted once the Three.js scene owns the page. */
+.debug {
+  margin: 0;
+  padding: 1rem;
+  font: 13px/1.6 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #7dffb0;
+  white-space: pre;
+}
+
+.debug-error {
+  color: #ff6b6b;
+}
