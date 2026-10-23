@@ -9,6 +9,8 @@ export const POSE_LANDMARKS = {
   RIGHT_EYE: 5,
   LEFT_SHOULDER: 11,
   RIGHT_SHOULDER: 12,
+  LEFT_HIP: 23,
+  RIGHT_HIP: 24,
 }
 
 /**
