@@ -11,18 +11,23 @@ Interaction loop (IDLE → APPROACH → EXIT TRIGGER) and hardware/optics detail
 ## Current state — read before editing `src/`
 - The `vision/` layer is built: `camera.js` (getUserMedia), `pose.js` (PoseLandmarker plus
   `personDistance`, the metres-to-camera estimate), `gesture.js` (GestureRecognizer + the
-  EXTEND_HAND trigger), and `fileset.js`, which shares one WASM runtime between both models
-  instead of letting each instantiate its own copy. Tunables live in `src/config.js`.
+  EXTEND_HAND trigger), `face.js` (FaceLandmarker plus the face-oval contour), and `fileset.js`,
+  which shares one WASM runtime across all three models instead of letting each instantiate its
+  own copy. Tunables live in `src/config.js` (`POSE`, `GESTURE`, `FACE`, `PERSONA`).
 - `src/state.js` holds the IDLE → APPROACH → EXIT state machine. It is pure and
   framework-free: it reads a distance, an extend-hand boolean and a timestamp per frame and
   returns the state plus edge events, so it is verified with no camera by
   `src/dev/stateHarness.js`, which replays scripted input timelines and prints a PASS/FAIL
   report to the console under `npm run dev`.
-- `src/main.js` boots the camera + both models, wires the pose distance and the extend-hand
-  trigger into the state machine, and prints a temporary `#debug` readout so the loop can be
-  verified. **No Three.js code exists yet** — `src/scene/` and `src/audio/` are still to be
-  written and will hang off the state machine's events, so treat the debug readout as
-  scaffolding to replace, not as the application.
+- `src/main.js` boots the camera + the pose, gesture and face models, wires the pose distance
+  and the extend-hand trigger into the state machine, and drives the scene each frame.
+- The `scene/` layer is built: `renderer.js` owns the black canvas and an orthographic camera
+  aligned to the mirror; `persona.js` renders the wispy, dusty figure — a shoulder→hip mesh
+  burned into animated noise, a drifting dust cloud, and the face-oval contour in front — and
+  only shows outside IDLE. It consumes normalised landmarks only (flipped horizontally to match
+  the mirror) and is tuned through `PERSONA` in `src/config.js`. `src/audio/` and
+  `scene/effects/glassBreak.js` are still to be written and will hang off the state machine's
+  events.
 - Single-package Vite app, no framework. `src/main.js` is the entry (referenced by
   `index.html`); styles live in `src/style.css`.
 
@@ -35,7 +40,8 @@ Interaction loop (IDLE → APPROACH → EXIT TRIGGER) and hardware/optics detail
 
 ## MediaPipe / assets (non-obvious)
 Model and runtime files are vendored locally so the prop works offline:
-- `public/models/pose_landmarker_lite.task`, `public/models/gesture_recognizer.task`
+- `public/models/pose_landmarker_lite.task`, `public/models/gesture_recognizer.task`,
+  `public/models/face_landmarker.task`
 - `public/wasm/vision_wasm_*` — the MediaPipe tasks-vision WASM runtime
 
 Load these local copies instead of the usual CDN URLs, e.g.

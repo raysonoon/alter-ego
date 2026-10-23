@@ -1,8 +1,6 @@
-// Central tunables for the Magic Mirror prop. Every magic number that affects the
-// interaction loop lives here so the loop can be re-tuned without hunting through modules.
+// Central tunables for the Magic Mirror prop
 
 /**
- * Vite serves `public/` at the web root, so these are absolute URLs, not filesystem paths.
  * Both the models and the WASM runtime are vendored locally so the prop runs offline.
  */
 export const WASM_PATH = '/wasm'
@@ -10,6 +8,7 @@ export const WASM_PATH = '/wasm'
 export const MODEL_PATHS = {
   pose: '/models/pose_landmarker_lite.task',
   gesture: '/models/gesture_recognizer.task',
+  face: '/models/face_landmarker.task',
 }
 
 /**
@@ -78,6 +77,18 @@ export const GESTURE = {
 }
 
 /**
+ * The persona's face contour. BlazePose only reports a handful of face points (nose, eyes,
+ * ears, mouth), which is not enough to outline a face, so a dedicated FaceLandmarker supplies
+ * the 478-point face mesh and its `FACE_LANDMARKS_FACE_OVAL` contour.
+ */
+export const FACE = {
+  numFaces: 1,
+  minFaceDetectionConfidence: 0.5,
+  minFacePresenceConfidence: 0.5,
+  minTrackingConfidence: 0.5,
+}
+
+/**
  * EXIT TRIGGER: the player extends a hand toward the mirror — fingers pointing at the camera —
  * and holds it still.
  *
@@ -123,4 +134,58 @@ export const EXTEND_HAND = {
   holdMs: 1200,
   /** Minimum gap between triggers. */
   cooldownMs: 1500,
+}
+
+/**
+ * PERSONA: the figure that materialises while the player is at the mirror.
+ *
+ * Two layers share one silhouette:
+ *   - a coarse shoulder→hip mesh whose fragment shader burns its edges into animated noise,
+ *     giving the smoky body;
+ *   - a dust cloud of points seeded across the same volume, drifting on their own noise, so
+ *     the body looks like it is unravelling into particles.
+ * The FaceLandmarker's face-oval contour then sits just in front as a dim cool line.
+ *
+ * The colours are deliberately low-luminance to replace the reflection
+ */
+export const PERSONA = {
+  bodyColor: 0x2b3550,
+  dustColor: 0x6f8fc4,
+  faceColor: 0x9fd8ff,
+
+  /** Peak alphas for each layer, before the materialise/dissolve ramp. */
+  bodyOpacity: 0.55,
+  dustOpacity: 0.5,
+  faceOpacity: 0.9,
+
+  /** Torso mesh subdivision. More cells = a smoother dissolve, at a vertex cost. */
+  columns: 24,
+  rows: 32,
+
+  /** Dust cloud. */
+  particleCount: 900,
+  particleRadius: 7,
+  /** Dust may spill past the silhouette edge so the body reads as unravelling. */
+  dustSpread: 1.22,
+  /** Torso thickness and per-particle drift, in mirror-frame world units. */
+  depth: 0.22,
+  drift: 0.06,
+  rise: 0.04,
+
+  /** Noise look: spatial frequency (x, y) for the fringe, and animation speed. */
+  noiseScale: [3.0, 6.0],
+  /** Fraction of the noise field burned away at full opacity. Higher = thinner smoke. */
+  dissolve: 0.18,
+  /** At zero opacity the smoke is almost all holes, so it coalesces as it appears. */
+  dissolveAtZero: 0.6,
+  dissolveSoftness: 0.35,
+  /** Vertex billow amplitude, in world units. */
+  displace: 0.05,
+
+  /** Opacity ramp time constants (seconds) for appearing and dissolving. */
+  appearTau: 0.5,
+  disappearTau: 0.7,
+
+  /** How far in front of the torso the face contour sits. */
+  faceDepth: 0.06,
 }

@@ -13,10 +13,12 @@ An interactive, automated "Magic Mirror" escape room prop
 - MediaPipe Task Vision
 
 ## File Structure
-The `vision/` layer is implemented (`camera.js`, `pose.js`, `gesture.js`, plus `fileset.js`
-for the shared WASM runtime) along with `config.js` and the `state.js` state machine;
-`main.js` boots those models, wires them into the state machine, and shows a temporary debug
-readout so the loop can be verified. `scene/` and `audio/` are still to be written. Each
+The `vision/` layer is implemented (`camera.js`, `pose.js`, `gesture.js`, `face.js`, plus
+`fileset.js` for the shared WASM runtime) along with `config.js` and the `state.js` state
+machine. The `scene/` layer now renders the persona: `renderer.js` owns the black canvas and an
+orthographic camera, and `persona.js` draws the wispy shoulder→hip silhouette (noise-dissolved
+mesh + drifting dust) with the FaceLandmarker's face-oval contour in front. `main.js` boots the
+models and drives the persona from the state machine. `audio/` is still to be written. Each
 concern — vision, state machine, scene, audio — lives in its own folder so the interaction
 loop can be traced from one file to the next.
 
@@ -26,7 +28,8 @@ alter-ego/
 ├── public/                     # served at web root (/models, /wasm)
 │   ├── models/                 # vendored MediaPipe task files
 │   │   ├── pose_landmarker_lite.task
-│   │   └── gesture_recognizer.task
+│   │   ├── gesture_recognizer.task
+│   │   └── face_landmarker.task
 │   ├── wasm/                   # vendored tasks-vision WASM runtime
 │   └── audio/                  # voiceover clips + Nietzsche quote
 ├── src/
@@ -38,14 +41,15 @@ alter-ego/
 │   │   ├── camera.js           # getUserMedia setup + video element
 │   │   ├── fileset.js          # shared tasks-vision WASM runtime, loaded once
 │   │   ├── pose.js             # PoseLandmarker + personDistance (metres to camera)
-│   │   └── gesture.js          # GestureRecognizer + EXTEND_HAND (closeness/depth/stillness) trigger
+│   │   ├── gesture.js          # GestureRecognizer + EXTEND_HAND (closeness/depth/stillness) trigger
+│   │   └── face.js             # FaceLandmarker + the face-oval contour
 │   ├── dev/
 │   │   └── stateHarness.js     # camera-free state-machine verification (scripted timelines)
 │   ├── scene/
-│   │   ├── renderer.js         # Three.js renderer, camera, render loop
-│   │   ├── persona.js          # the materializing figure + gaze mirroring
+│   │   ├── renderer.js         # Three.js renderer, orthographic camera, resize
+│   │   ├── persona.js          # shoulder→hip dissolve mesh + dust cloud + face contour
 │   │   └── effects/
-│   │       └── glassBreak.js   # glass-break visual effect
+│   │       └── glassBreak.js   # glass-break visual effect (not written yet)
 │   └── audio/
 │       └── voiceover.js        # audio playback for the exit trigger
 └── diagrams/
@@ -59,4 +63,8 @@ Notes:
   and returns edge events (`enterApproach`, `enterExit`, `enterIdle`) that `scene/` and
   `audio/` will hang off. It is pure (no DOM, no MediaPipe, no Three.js), which is what lets
   `dev/stateHarness.js` verify it without a camera.
+- `scene/persona.js` maps normalised landmarks onto an orthographic frame (flipped horizontally
+  to line up with the mirror) and exists only outside IDLE: a shoulder→hip mesh is burned into
+  animated noise, a dust cloud drifts over it, and the `face.js` face-oval contour sits in
+  front. All colours, opacity, noise and ramp timings live in `PERSONA` in `config.js`.
 - Keep the page background pure black (`#000000`); no HTML chrome around the canvas.
