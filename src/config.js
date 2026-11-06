@@ -122,9 +122,9 @@ export const HAND = {
 }
 
 /**
- * The persona's face contour. BlazePose only reports a handful of face points (nose, eyes,
- * ears, mouth), which is not enough to outline a face, so a dedicated FaceLandmarker supplies
- * the 478-point face mesh and its `FACE_LANDMARKS_FACE_OVAL` contour.
+ * The persona's face mesh. BlazePose only reports a handful of face points (nose, eyes, ears,
+ * mouth), which is not enough to fill a face, so a dedicated FaceLandmarker supplies the
+ * 478-point face mesh and its tesselation.
  */
 export const FACE = {
   numFaces: 1,
@@ -184,9 +184,8 @@ export const EXTEND_HAND = {
 /**
  * PERSONA: the figure that materialises while the player is at the mirror.
  *
- * A dust cloud seeded across the shoulder→hip volume forms the wispy torso silhouette; the
- * tesselated face surface and ghost-face contour points sit in front, with a dust halo around
- * the head.
+ * A dust cloud seeded across the shoulder→hip volume forms the wispy torso silhouette; a filled,
+ * carved face-dust point cloud sits in front, with a dust halo around the head.
  *
  * The colours are deliberately low-luminance to replace the reflection
  */
@@ -196,7 +195,6 @@ export const PERSONA = {
 
   /** Peak alphas for each layer, before the materialise/dissolve ramp. */
   dustOpacity: 0.9,
-  faceOpacity: 0.02,
 
   /** Dust cloud. */
   particleCount: 900,
@@ -225,29 +223,16 @@ export const PERSONA = {
   disappearTau: 0.7,
 
   /**
-   * Ghost face: the face features (oval, lips, eyes, nose) are drawn as soft additive points
-   * sampled along each contour. `faceSubdiv` samples per segment, `facePointSize` is the sprite
-   * radius in px, `faceJitter` the per-point shimmer, `facePointAlpha` the per-point alpha
-   * (overlaps accumulate, so keep it low).
+   * Face dust: a filled point cloud seeded across the face mesh, drifting like the torso dust and
+   * carved around the eyes/nose/mouth. `faceCarveSoftness` is the world-unit falloff at a carved
+   * feature's edge (0 = hard cut), so the empty shapes read as soft voids rather than stamps.
    */
-  faceSubdiv: 3,
-  facePointSize: 5,
-  faceJitter: 0.008,
-  facePointAlpha: 0.6,
-
-  /**
-   * Face surface: the tesselated face mesh, dissolved by procedural noise so it vanishes piece
-   * by piece. `faceDissolve` is the burn threshold at full opacity, `faceDissolveAtZero` at
-   * zero opacity (higher = more holes while materialising/dissolving).
-   */
-  faceSurfaceOpacity: 0.650,
-  faceDissolve: 0.110,
-  faceDissolveAtZero: 1,
-  faceDissolveSoftness: 0.4,
-  faceNoiseScale: 2.75,
-  faceNoiseSpeed: 0.15,
-  /** Fraction of the face radius that stays solid before the edge fade begins (0–1). */
-  faceFadeStart: 0.5,
+  faceDustCount: 750,
+  faceDustSize: 5,
+  faceDustOpacity: 0.55,
+  faceDustDrift: 0.012,
+  faceDustRise: 0.006,
+  faceCarveSoftness: 0.02,
 
   /** How far in front of the torso the face sits. */
   faceDepth: 0.06,

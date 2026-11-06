@@ -6,24 +6,18 @@ import { POSE_LANDMARKS } from '../vision/pose.js'
 const DEV = Boolean(import.meta.env?.DEV)
 
 /**
- * Default tunables for the face layers. They mirror the `PERSONA` config so the current values
- * stay the defaults, but they are also exposed as the overridable `face` parameter of
- * `createPersona` — pass e.g. `face: { faceOpacity: 0.7 }` to adjust at the call site.
+ * Default tunables for the face-dust layer (the filled, carved point cloud). These mirror
+ * `PERSONA` so the current values stay the defaults, but they are exposed as the overridable
+ * `face` parameter of `createPersona` — pass e.g. `face: { faceDustDrift: 0.02 }` at the call site.
  */
-export const FACE_DEFAULTS = {
+export const FACE_DUST_DEFAULTS = {
   faceColor: PERSONA.faceColor,
-  faceOpacity: PERSONA.faceOpacity,
-  faceSubdiv: PERSONA.faceSubdiv,
-  facePointSize: PERSONA.facePointSize,
-  faceJitter: PERSONA.faceJitter,
-  facePointAlpha: PERSONA.facePointAlpha,
-  faceSurfaceOpacity: PERSONA.faceSurfaceOpacity,
-  faceDissolve: PERSONA.faceDissolve,
-  faceDissolveAtZero: PERSONA.faceDissolveAtZero,
-  faceDissolveSoftness: PERSONA.faceDissolveSoftness,
-  faceNoiseScale: PERSONA.faceNoiseScale,
-  faceNoiseSpeed: PERSONA.faceNoiseSpeed,
-  faceFadeStart: PERSONA.faceFadeStart,
+  faceDustCount: PERSONA.faceDustCount,
+  faceDustSize: PERSONA.faceDustSize,
+  faceDustOpacity: PERSONA.faceDustOpacity,
+  faceDustDrift: PERSONA.faceDustDrift,
+  faceDustRise: PERSONA.faceDustRise,
+  faceCarveSoftness: PERSONA.faceCarveSoftness,
   faceDepth: PERSONA.faceDepth,
 }
 
@@ -74,44 +68,14 @@ export const HAND_DEFAULTS = {
  *   - `dust`   — points seeded across the shoulder→hip volume, drifting on their own noise so the
  *                torso reads as a wispy, dusty silhouette;
  *   - `hand`   — one small dust cloud per tracked hand, seeded across that hand's bounding box;
- *   - `face`   — the tesselated face surface plus the ghost-face contour points, with a dust halo
- *                around the head.
+ *   - `face`   — a filled, drifting point cloud across the whole face, with the eyes, nose and
+ *                mouth carved out as empty space.
+ *   - `headDust` — a halo of dust around the face.
  *
  * Only normalised landmark coordinates are used for geometry: they are what the mirror shows,
  * so mapping them straight onto the orthographic frame keeps the figure aligned with the
  * player's reflection. (Aspect handling lives in `toWorld`, so x and y map at the same scale.)
  */
-
-/** Value noise + fbm, shared by every shader in this module. Returns roughly [0, 1]. */
-const NOISE_GLSL = /* glsl */ `
-  float hash21(vec2 p) {
-    p = fract(p * vec2(123.34, 456.21));
-    p += dot(p, p + 45.32);
-    return fract(p.x * p.y);
-  }
-
-  float valueNoise(vec2 p) {
-    vec2 i = floor(p);
-    vec2 f = fract(p);
-    vec2 u = f * f * (3.0 - 2.0 * f);
-    float a = hash21(i);
-    float b = hash21(i + vec2(1.0, 0.0));
-    float c = hash21(i + vec2(0.0, 1.0));
-    float d = hash21(i + vec2(1.0, 1.0));
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
-  }
-
-  float fbm(vec2 p) {
-    float value = 0.0;
-    float amplitude = 0.5;
-    for (int i = 0; i < 4; i++) {
-      value += amplitude * valueNoise(p);
-      p = p * 2.02 + 7.13;
-      amplitude *= 0.5;
-    }
-    return value;
-  }
-`
 
 /**
  * 3D value noise. The extra axis lets time be a real dimension, so dissolve patterns morph in
@@ -330,99 +294,39 @@ const HEAD_DUST_VERTEX = /* glsl */ `
 `
 
 /**
- * The ghost face is a cloud of soft additive points sampled along every face contour. Points
- * (not lines) are what make it read as one ghostly face: sparse, soft sprites pool into glowing
- * strokes instead of hard vector wireframe.
+ * Face dust: a filled point cloud seeded across the face mesh. Positions are written on the CPU
+ * every frame (barycentric interpolation of the live landmarks, plus drift), so this shader only
+ * has to size the sprite and pass the per-particle carve mask through. `aMask` is 0 over the
+ * eyes/nose/mouth holes and 1 over the skin, with a soft edge — that is what keeps those
+ * features as empty space rather than dust.
  */
-const GHOST_VERTEX = /* glsl */ `
+const FACE_DUST_VERTEX = /* glsl */ `
   attribute float aSize;
-  attribute float aSeed;
+  attribute float aMask;
 
-  uniform float uTime;
   uniform float uPointScale;
-  uniform float uJitter;
-
-  ${NOISE_GLSL}
-
-  void main() {
-    vec3 p = position;
-
-    // Per-point shimmer, so the face drifts like smoke rather than sitting as a rig.
-    float n1 = valueNoise(vec2(aSeed * 91.7, uTime * 0.35));
-    float n2 = valueNoise(vec2(aSeed * 37.3 + 4.1, uTime * 0.28));
-    p.x += (n1 - 0.5) * uJitter;
-    p.y += (n2 - 0.5) * uJitter;
-
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-    gl_PointSize = aSize * uPointScale;
-  }
-`
-
-const GHOST_FRAGMENT = /* glsl */ `
-  uniform vec3 uColor;
   uniform float uOpacity;
-  uniform float uGlow;
+
+  varying float vMask;
 
   void main() {
-    // Soft radial sprite; additive blending lets overlapping points pool into a glow.
-    float d = length(gl_PointCoord - 0.5);
-    float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uOpacity * uGlow;
-    if (alpha < 0.003) discard;
-    gl_FragColor = vec4(uColor, alpha);
-  }
-`
-
-/**
- * The tesselated face surface: a filled, translucent mask whose alpha is carved by a
- * face-anchored procedural noise field. Raising `uDissolve` burns away the low-noise regions
- * first, so the surface vanishes piece by piece instead of fading uniformly.
- */
-const FACE_SURFACE_VERTEX = /* glsl */ `
-  attribute vec2 aCoord;
-  varying vec2 vUv;
-  varying float vEdge;
-
-  uniform vec2 uCenter;
-  uniform float uRadius;
-
-  void main() {
-    // aCoord is the landmark's normalised image position, so the dissolve pattern sticks to the
-    // face as it moves rather than sliding across the mirror.
-    vUv = aCoord;
-
-    // Normalised distance from the face centre, used to fade the mask out at its boundary.
-    vEdge = uRadius > 0.0 ? distance(position.xy, uCenter) / uRadius : 0.0;
-
+    vMask = aMask;
     gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
   }
 `
 
-const FACE_SURFACE_FRAGMENT = /* glsl */ `
-  varying vec2 vUv;
-  varying float vEdge;
-
-  uniform float uTime;
+const FACE_DUST_FRAGMENT = /* glsl */ `
   uniform vec3 uColor;
   uniform float uOpacity;
-  uniform float uDissolve;
-  uniform float uSoftness;
-  uniform float uNoiseScale;
-  uniform float uNoiseSpeed;
-  uniform float uFadeStart;
 
-  ${NOISE3D_GLSL}
+  varying float vMask;
 
   void main() {
-    // Time is the third axis, so the burn pattern morphs in place instead of sliding across the
-    // face as it would with a drifting 2D slice.
-    float n = fbm3(vec3(vUv * uNoiseScale, uTime * uNoiseSpeed));
-    float burn = smoothstep(uDissolve, uDissolve + uSoftness, n);
-
-    // Solid through the centre, melting to nothing at the face boundary.
-    float fade = 1.0 - smoothstep(uFadeStart, 1.0, vEdge);
-
-    float alpha = uOpacity * burn * fade;
-    if (alpha < 0.004) discard;
+    // Soft round sprite, faded by the carve mask so feature holes stay empty.
+    float d = length(gl_PointCoord - 0.5);
+    float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uOpacity * vMask;
+    if (alpha < 0.003) discard;
     gl_FragColor = vec4(uColor, alpha);
   }
 `
@@ -637,48 +541,59 @@ function createHeadDust(spec, pixelRatio) {
   return { points, uniforms }
 }
 
-function createGhostFace(features, spec, pixelRatio) {
-  // Flatten every feature's connections into sampled points. Sampling along each segment (rather
-  // than only at its endpoints) is what turns the contour into a continuous soft stroke.
-  const start = []
-  const end = []
-  const t = []
-  const featuresPerPoint = []
-  const seeds = []
-  const sizes = []
+/**
+ * Face dust: sample particles uniformly across the face tesselation. Each particle stores the
+ * triangle it landed in plus barycentric weights, so its world position can be rebuilt from the
+ * live landmarks every frame — which is what keeps the fill glued to the moving face.
+ *
+ * The eyes/nose/mouth are not excluded here: the tesselation covers them too, and they are
+ * punched out later by the carve mask. That keeps the seeding a single uniform pass.
+ */
+function createFaceDust(triangles, spec, pixelRatio) {
+  const triangleCount = Math.floor(triangles.length / 3)
+  const count = triangleCount ? spec.faceDustCount : 0
 
-  for (let f = 0; f < features.length; f += 1) {
-    for (const connection of features[f].connections) {
-      for (let k = 0; k < spec.faceSubdiv; k += 1) {
-        start.push(connection.start)
-        end.push(connection.end)
-        t.push((k + 0.5) / spec.faceSubdiv)
-        featuresPerPoint.push(f)
-        seeds.push(Math.random())
-        sizes.push(0.6 + Math.random() * 0.8)
-      }
+  const positions = new Float32Array(count * 3)
+  const sizes = new Float32Array(count)
+  const masks = new Float32Array(count)
+  const seeds = new Float32Array(count)
+  const baryU = new Float32Array(count)
+  const baryV = new Float32Array(count)
+  const triangle = new Uint16Array(count)
+
+  for (let i = 0; i < count; i += 1) {
+    // Uniform barycentric point inside a randomly chosen triangle.
+    triangle[i] = Math.floor(Math.random() * triangleCount)
+    let u = Math.random()
+    let v = Math.random()
+    if (u + v > 1) {
+      u = 1 - u
+      v = 1 - v
     }
+    baryU[i] = u
+    baryV[i] = v
+
+    seeds[i] = Math.random()
+    sizes[i] = 0.6 + Math.random() * 0.8
+    masks[i] = 1
   }
 
-  const count = start.length
   const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3))
-  geometry.setAttribute('aSeed', new THREE.BufferAttribute(Float32Array.from(seeds), 1))
-  geometry.setAttribute('aSize', new THREE.BufferAttribute(Float32Array.from(sizes), 1))
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+  geometry.setAttribute('aMask', new THREE.BufferAttribute(masks, 1))
 
   const uniforms = {
     uTime: { value: 0 },
     uColor: { value: new THREE.Color(spec.faceColor) },
     uOpacity: { value: 0 },
-    uGlow: { value: spec.facePointAlpha },
-    uPointScale: { value: spec.facePointSize * pixelRatio },
-    uJitter: { value: spec.faceJitter },
+    uPointScale: { value: spec.faceDustSize * pixelRatio },
   }
 
   const material = new THREE.ShaderMaterial({
     uniforms,
-    vertexShader: GHOST_VERTEX,
-    fragmentShader: GHOST_FRAGMENT,
+    vertexShader: FACE_DUST_VERTEX,
+    fragmentShader: FACE_DUST_FRAGMENT,
     transparent: true,
     depthTest: false,
     depthWrite: false,
@@ -686,68 +601,161 @@ function createGhostFace(features, spec, pixelRatio) {
   })
 
   const points = new THREE.Points(geometry, material)
-  points.name = 'face'
+  points.name = 'faceDust'
   points.frustumCulled = false
-  points.renderOrder = 3 // above the dissolving surface
+  points.renderOrder = 3
   points.visible = false
 
   return {
     points,
     geometry,
     uniforms,
-    featuresCount: features.length,
-    layout: {
-      count,
-      start: Int16Array.from(start),
-      end: Int16Array.from(end),
-      t: Float32Array.from(t),
-      feature: Int8Array.from(featuresPerPoint),
-    },
+    count,
+    triangleCount,
+    triangles,
+    layout: { triangle, baryU, baryV, seeds },
+    // Scratch buffers for the per-frame landmark projection, grown on demand.
+    worldX: new Float32Array(0),
+    worldY: new Float32Array(0),
   }
-}
-
-function createFaceSurface(triangles, spec) {
-  const vertexCount = triangles.length ? Math.max(...triangles) + 1 : 0
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3))
-  geometry.setAttribute('aCoord', new THREE.BufferAttribute(new Float32Array(vertexCount * 2), 2))
-  geometry.setIndex(new THREE.BufferAttribute(triangles, 1))
-
-  const uniforms = {
-    uTime: { value: 0 },
-    uColor: { value: new THREE.Color(spec.faceColor) },
-    uOpacity: { value: 0 },
-    uDissolve: { value: spec.faceDissolveAtZero },
-    uSoftness: { value: spec.faceDissolveSoftness },
-    uNoiseScale: { value: spec.faceNoiseScale },
-    uNoiseSpeed: { value: spec.faceNoiseSpeed },
-    uCenter: { value: new THREE.Vector2() },
-    uRadius: { value: 0 },
-    uFadeStart: { value: spec.faceFadeStart },
-  }
-
-  const material = new THREE.ShaderMaterial({
-    uniforms,
-    vertexShader: FACE_SURFACE_VERTEX,
-    fragmentShader: FACE_SURFACE_FRAGMENT,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    blending: THREE.NormalBlending,
-  })
-
-  const mesh = new THREE.Mesh(geometry, material)
-  mesh.name = 'faceSurface'
-  mesh.frustumCulled = false
-  mesh.renderOrder = 2
-  mesh.visible = false
-
-  return { mesh, geometry, uniforms, vertexCount }
 }
 
 const midpoint = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
 const distance = (a, b) => Math.hypot(a.x - b.x, a.y - b.y)
+
+/** Shader-style smoothstep, used for the soft carve edge around a feature. */
+function smoothstep01(t) {
+  const x = Math.min(Math.max(t, 0), 1)
+  return x * x * (3 - 2 * x)
+}
+
+/** Even-odd point-in-polygon test over a flat [x0, y0, x1, y1, …] array. */
+function pointInPolygon(x, y, polygon) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 2; i < polygon.length; j = i, i += 2) {
+    const xi = polygon[i]
+    const yi = polygon[i + 1]
+    const xj = polygon[j]
+    const yj = polygon[j + 1]
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) {
+      inside = !inside
+    }
+  }
+  return inside
+}
+
+/** Squared distance from a point to a segment (avoids a sqrt per edge). */
+function distanceToSegmentSq(px, py, ax, ay, bx, by) {
+  const dx = bx - ax
+  const dy = by - ay
+  const lenSq = dx * dx + dy * dy
+  let t = lenSq > 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0
+  t = Math.min(Math.max(t, 0), 1)
+  const ex = px - (ax + t * dx)
+  const ey = py - (ay + t * dy)
+  return ex * ex + ey * ey
+}
+
+/** Convex hull (monotone chain) of [x, y] points, returned as a flat polygon. */
+function convexHull(points) {
+  const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1])
+  const cross = (o, a, b) =>
+    (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+  const lower = []
+  for (const p of pts) {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) {
+      lower.pop()
+    }
+    lower.push(p)
+  }
+
+  const upper = []
+  for (let i = pts.length - 1; i >= 0; i -= 1) {
+    const p = pts[i]
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) {
+      upper.pop()
+    }
+    upper.push(p)
+  }
+
+  lower.pop()
+  upper.pop()
+  return lower.concat(upper).flatMap((p) => [p[0], p[1]])
+}
+
+/**
+ * Build the carve polygons in world space from the live landmarks. A region with a missing or
+ * non-finite vertex is skipped, so one bad landmark cannot blank the whole face.
+ */
+function buildCarveRegions(regions, worldX, worldY) {
+  const polygons = []
+
+  for (const region of regions) {
+    const points = []
+    let valid = true
+    for (const index of region.indices) {
+      const x = worldX[index]
+      const y = worldY[index]
+      if (!Number.isFinite(x) || !Number.isFinite(y)) {
+        valid = false
+        break
+      }
+      points.push([x, y])
+    }
+    if (!valid || points.length < 3) continue
+
+    const polygon = region.hull ? convexHull(points) : points.flatMap((p) => p)
+    if (polygon.length < 6) continue
+
+    let minX = Infinity
+    let maxX = -Infinity
+    let minY = Infinity
+    let maxY = -Infinity
+    for (let i = 0; i < polygon.length; i += 2) {
+      minX = Math.min(minX, polygon[i])
+      maxX = Math.max(maxX, polygon[i])
+      minY = Math.min(minY, polygon[i + 1])
+      maxY = Math.max(maxY, polygon[i + 1])
+    }
+    polygons.push({ points: polygon, minX, maxX, minY, maxY })
+  }
+
+  return polygons
+}
+
+/** 1 over skin, 0 inside a carved feature, with a soft falloff of `softness` at its edge. */
+function carveMask(px, py, polygons, softness) {
+  let mask = 1
+  for (const polygon of polygons) {
+    // Bounding-box prune: points well outside a feature can't be affected by it.
+    if (
+      px < polygon.minX - softness ||
+      px > polygon.maxX + softness ||
+      py < polygon.minY - softness ||
+      py > polygon.maxY + softness
+    ) {
+      continue
+    }
+    if (pointInPolygon(px, py, polygon.points)) return 0
+
+    let nearestSq = Infinity
+    const points = polygon.points
+    for (let i = 0, j = points.length - 2; i < points.length; j = i, i += 2) {
+      const d = distanceToSegmentSq(px, py, points[j], points[j + 1], points[i], points[i + 1])
+      if (d < nearestSq) nearestSq = d
+    }
+
+    const distance = Math.sqrt(nearestSq)
+    const edge = softness > 1e-6
+      ? smoothstep01(distance / softness)
+      : distance > 1e-6
+        ? 1
+        : 0
+    if (edge < mask) mask = edge
+  }
+  return mask
+}
 
 /**
  * Normalised image coords → mirror-frame world coords.
@@ -825,186 +833,6 @@ function updateTorso(landmarks, view, torso, dustUniforms) {
   dustUniforms.uTorsoHeight.value = torsoHeight
 }
 
-function updateGhostFace(faceLandmarks, ghost, view, depth) {
-  const { points, layout } = ghost
-  const total = layout.count
-
-  if (!total) {
-    points.visible = false
-    return { visible: false, reason: 'no-features', landmarks: 0, total: 0, bad: null }
-  }
-  if (!faceLandmarks) {
-    points.visible = false
-    return { visible: false, reason: 'no-face', landmarks: 0, total, bad: null }
-  }
-
-  // Distinguish a bad view from a bad landmark: a non-finite aspect poisons every mapped point
-  // (and also stops the torso shaping), so name the actual value rather than blaming a landmark.
-  const halfWidth = view?.halfWidth
-  const halfHeight = view?.halfHeight
-  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
-    points.visible = false
-    return {
-      visible: false,
-      reason: `non-finite view: halfWidth=${halfWidth} halfHeight=${halfHeight}`,
-      landmarks: faceLandmarks.length,
-      total,
-      bad: { kind: 'view', halfWidth, halfHeight, view },
-    }
-  }
-
-  const positions = ghost.geometry.attributes.position
-  const fullWidth = halfWidth * 2
-  const fullHeight = halfHeight * 2
-
-  let minX = Infinity
-  let maxX = -Infinity
-  let minY = Infinity
-  let maxY = -Infinity
-  let written = 0
-  let badCount = 0
-  let bad = null
-
-  for (let i = 0; i < total; i += 1) {
-    const landmarkStart = layout.start[i]
-    const landmarkEnd = layout.end[i]
-    const a = faceLandmarks[landmarkStart]
-    const b = faceLandmarks[landmarkEnd]
-    if (!a || !b) {
-      badCount += 1
-      continue
-    }
-
-    const ax = a.x
-    const ay = a.y
-    const bx = b.x
-    const by = b.y
-
-    // Record the exact culprit the first time it appears, but keep drawing the rest of the
-    // face — one bad landmark should not blank the whole ghost while we diagnose it.
-    if (
-      !Number.isFinite(ax) || !Number.isFinite(ay) ||
-      !Number.isFinite(bx) || !Number.isFinite(by)
-    ) {
-      badCount += 1
-      if (!bad) {
-        const useA = !Number.isFinite(ax) || !Number.isFinite(ay)
-        const index = useA ? landmarkStart : landmarkEnd
-        const landmark = useA ? a : b
-        const field = !Number.isFinite(landmark.x) ? 'x' : 'y'
-        bad = { kind: 'landmark', index, field, value: landmark[field], raw: landmark }
-      }
-      continue
-    }
-
-    const t = layout.t[i]
-    const x = (0.5 - (ax + (bx - ax) * t)) * fullWidth
-    const y = (0.5 - (ay + (by - ay) * t)) * fullHeight
-
-    positions.setXYZ(i, x, y, depth)
-
-    minX = Math.min(minX, x)
-    maxX = Math.max(maxX, x)
-    minY = Math.min(minY, y)
-    maxY = Math.max(maxY, y)
-    written += 1
-  }
-
-  positions.needsUpdate = written > 0
-  points.visible = written > 0
-
-  if (written === 0) {
-    return {
-      visible: false,
-      reason: bad
-        ? `non-finite landmark ${bad.index}.${bad.field}=${bad.value}`
-        : 'no points written',
-      landmarks: faceLandmarks.length,
-      total,
-      bad,
-      badCount,
-    }
-  }
-
-  // World-space bounds, so the readout shows whether the face is on-frame and what size it is.
-  return {
-    visible: true,
-    reason: bad
-      ? `partial: ${badCount} bad (e.g. ${bad.index}.${bad.field}=${bad.value})`
-      : 'ok',
-    landmarks: faceLandmarks.length,
-    total,
-    written,
-    bad,
-    badCount,
-    width: maxX - minX,
-    height: maxY - minY,
-    x: (minX + maxX) / 2,
-    y: (minY + maxY) / 2,
-  }
-}
-
-function updateFaceSurface(faceLandmarks, surface, view, depth) {
-  const { mesh, geometry, vertexCount } = surface
-
-  if (!vertexCount) {
-    mesh.visible = false
-    return { visible: false, reason: 'no-triangles' }
-  }
-  if (!faceLandmarks) {
-    mesh.visible = false
-    return { visible: false, reason: 'no-face' }
-  }
-
-  const halfWidth = view?.halfWidth
-  const halfHeight = view?.halfHeight
-  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
-    mesh.visible = false
-    return { visible: false, reason: 'non-finite view' }
-  }
-
-  const position = geometry.attributes.position
-  const coord = geometry.attributes.aCoord
-  const fullWidth = halfWidth * 2
-  const fullHeight = halfHeight * 2
-  let written = 0
-  let minX = Infinity
-  let maxX = -Infinity
-  let minY = Infinity
-  let maxY = -Infinity
-
-  for (let i = 0; i < vertexCount; i += 1) {
-    const landmark = faceLandmarks[i]
-    if (!landmark) continue
-
-    const { x, y } = landmark
-    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
-
-    const worldX = (0.5 - x) * fullWidth
-    const worldY = (0.5 - y) * fullHeight
-    position.setXYZ(i, worldX, worldY, depth)
-    coord.setXY(i, x, y)
-
-    minX = Math.min(minX, worldX)
-    maxX = Math.max(maxX, worldX)
-    minY = Math.min(minY, worldY)
-    maxY = Math.max(maxY, worldY)
-    written += 1
-  }
-
-  position.needsUpdate = written > 0
-  coord.needsUpdate = written > 0
-  mesh.visible = written > 0
-
-  // Feed the vertex shader the face centre/radius so the mask can fade out at its own boundary.
-  if (written > 0) {
-    surface.uniforms.uCenter.value.set((minX + maxX) / 2, (minY + maxY) / 2)
-    surface.uniforms.uRadius.value = Math.max(maxX - minX, maxY - minY) / 2
-  }
-
-  return { visible: mesh.visible, written, total: vertexCount }
-}
-
 function updateHeadDust(faceStatus, headDust, depth) {
   const radius = faceStatus?.visible
     ? Math.max(faceStatus.width, faceStatus.height) * 0.5
@@ -1015,10 +843,145 @@ function updateHeadDust(faceStatus, headDust, depth) {
     return
   }
 
-  // Reuse the ghost-face bounds: x/y is the face centre, width/height its world size.
+  // Reuse the face bounds: x/y is the face centre, width/height its world size.
   headDust.points.position.set(faceStatus.x, faceStatus.y, depth)
   headDust.uniforms.uRadius.value = radius
   headDust.points.visible = true
+}
+
+/**
+ * Drive the face-dust point cloud: rebuild every particle's world position from the live
+ * barycentric weights, drift it, and carve the eye/nose/mouth holes through its mask.
+ *
+ * Everything happens on the CPU so the carve tests the exact position that gets rendered. Returns
+ * the face bounds so the head halo can follow it.
+ */
+function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spec) {
+  const { points, geometry, count, layout } = faceDust
+
+  if (!count) {
+    points.visible = false
+    return { visible: false, reason: 'no-particles', total: 0 }
+  }
+  if (!faceLandmarks) {
+    points.visible = false
+    return { visible: false, reason: 'no-face', total: count }
+  }
+
+  const halfWidth = view?.halfWidth
+  const halfHeight = view?.halfHeight
+  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
+    points.visible = false
+    return { visible: false, reason: 'non-finite view', total: count }
+  }
+
+  // Project every landmark once; the particles reuse these.
+  const landmarkCount = faceLandmarks.length
+  if (faceDust.worldX.length < landmarkCount) {
+    faceDust.worldX = new Float32Array(landmarkCount)
+    faceDust.worldY = new Float32Array(landmarkCount)
+  }
+  const worldX = faceDust.worldX
+  const worldY = faceDust.worldY
+  const fullWidth = halfWidth * 2
+  const fullHeight = halfHeight * 2
+
+  for (let i = 0; i < landmarkCount; i += 1) {
+    const landmark = faceLandmarks[i]
+    if (!landmark || !Number.isFinite(landmark.x) || !Number.isFinite(landmark.y)) {
+      worldX[i] = NaN
+      worldY[i] = NaN
+      continue
+    }
+    worldX[i] = (0.5 - landmark.x) * fullWidth
+    worldY[i] = (0.5 - landmark.y) * fullHeight
+  }
+
+  const polygons = buildCarveRegions(regions, worldX, worldY)
+  const softness = spec.faceCarveSoftness
+  const drift = spec.faceDustDrift
+  const rise = spec.faceDustRise
+
+  const positions = geometry.attributes.position.array
+  const masks = geometry.attributes.aMask.array
+  const triangles = faceDust.triangles
+  const { triangle, baryU, baryV, seeds } = layout
+
+  let written = 0
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+
+  for (let i = 0; i < count; i += 1) {
+    const t = triangle[i] * 3
+    const a = triangles[t]
+    const b = triangles[t + 1]
+    const c = triangles[t + 2]
+    const ax = worldX[a]
+    const ay = worldY[a]
+    const bx = worldX[b]
+    const by = worldY[b]
+    const cx = worldX[c]
+    const cy = worldY[c]
+
+    if (
+      !Number.isFinite(ax) || !Number.isFinite(ay) ||
+      !Number.isFinite(bx) || !Number.isFinite(by) ||
+      !Number.isFinite(cx) || !Number.isFinite(cy)
+    ) {
+      masks[i] = 0
+      continue
+    }
+
+    const u = baryU[i]
+    const v = baryV[i]
+    const w0 = 1 - u - v
+
+    let x = w0 * ax + u * bx + v * cx
+    let y = w0 * ay + u * by + v * cy
+
+    // Per-particle drift, so the face breathes like the torso dust. Sinusoids with a per-particle
+    // phase read as organic smoke and are far cheaper than a full CPU noise field each frame.
+    const phase = seeds[i] * Math.PI * 2
+    x += Math.sin(time * 0.6 + phase) * drift
+    x += Math.sin(time * 1.7 + phase * 1.3) * drift * 0.35
+    y += Math.cos(time * 0.5 + phase * 0.7) * drift
+    y += Math.sin(time * 1.3 + phase * 2.1) * rise
+
+    const mask = polygons.length ? carveMask(x, y, polygons, softness) : 1
+    masks[i] = mask
+    positions[i * 3] = x
+    positions[i * 3 + 1] = y
+    positions[i * 3 + 2] = depth
+
+    if (mask > 0.01) {
+      minX = Math.min(minX, x)
+      maxX = Math.max(maxX, x)
+      minY = Math.min(minY, y)
+      maxY = Math.max(maxY, y)
+      written += 1
+    }
+  }
+
+  geometry.attributes.position.needsUpdate = written > 0
+  geometry.attributes.aMask.needsUpdate = true
+  points.visible = written > 0
+
+  if (!written) {
+    return { visible: false, reason: 'all-carved', total: count }
+  }
+
+  return {
+    visible: true,
+    reason: 'ok',
+    total: count,
+    written,
+    width: maxX - minX,
+    height: maxY - minY,
+    x: (minX + maxX) / 2,
+    y: (minY + maxY) / 2,
+  }
 }
 
 /** World-space bounding box of a hand's 21 landmarks, or null when it cannot be measured. */
@@ -1249,10 +1212,11 @@ function findNonFiniteVertex(geometry) {
 /**
  * @param {object} options
  * @param {{ halfWidth: number, halfHeight: number }} options.view mutable mirror-frame metrics
- * @param {Array<{ name: string, connections: Array<{start:number,end:number}> }>} options.faceFeatures
  * @param {Uint16Array|number[]} [options.faceTriangles] tesselation triangle indices
+ * @param {Array<{ name: string, indices: number[], hull?: boolean }>} [options.faceRegions]
+ *   closed landmark loops carved out of the face dust (eyes, nose, mouth)
  * @param {typeof PERSONA} [options.spec]
- * @param {Partial<typeof FACE_DEFAULTS>} [options.face] per-call face-layer overrides
+ * @param {Partial<typeof FACE_DUST_DEFAULTS>} [options.face] per-call face overrides
  * @param {Partial<typeof TORSO_DEFAULTS>} [options.torso] per-call torso-layer overrides
  * @param {Partial<typeof HAND_DEFAULTS>} [options.hand] per-call hand-dust overrides
  * @param {number} [options.handCount] number of hand-dust clouds to preallocate (one per hand)
@@ -1260,8 +1224,8 @@ function findNonFiniteVertex(geometry) {
  */
 export function createPersona({
   view,
-  faceFeatures = [],
   faceTriangles = [],
+  faceRegions = [],
   spec = PERSONA,
   face = {},
   torso: torsoOverrides = {},
@@ -1271,7 +1235,7 @@ export function createPersona({
 }) {
   // Face/torso/hand layers read from a merged spec so any value can be overridden at the call
   // site, while everything not passed falls back to the current config values.
-  const faceSpec = { ...FACE_DEFAULTS, ...face }
+  const faceSpec = { ...FACE_DUST_DEFAULTS, ...face }
   const torsoSpec = { ...TORSO_DEFAULTS, ...torsoOverrides }
   const handSpec = { ...HAND_DEFAULTS, ...handOverrides }
   // Guard against passing the renderer API instead of its `view` metrics (a silent mismatch:
@@ -1291,11 +1255,8 @@ export function createPersona({
   const dust = createDust(torsoSpec, pixelRatio)
   torso.add(dust.points)
 
-  const faceSurface = createFaceSurface(faceTriangles, faceSpec)
-  root.add(faceSurface.mesh)
-
-  const ghost = createGhostFace(faceFeatures, faceSpec, pixelRatio)
-  root.add(ghost.points)
+  const faceDust = createFaceDust(faceTriangles, faceSpec, pixelRatio)
+  root.add(faceDust.points)
 
   // A separate halo around the head; it lives in root (not the torso group) because it follows
   // the face, not the shoulders.
@@ -1329,14 +1290,12 @@ export function createPersona({
       { name: `handArmFore${i}`, object: arms[1].points },
       { name: `handCap${i}`, object: cap.points },
     ]),
-    { name: 'faceSurface', object: faceSurface.mesh },
-    { name: 'face', object: ghost.points },
+    { name: 'faceDust', object: faceDust.points },
   ]
   const reported = new Set()
 
   let opacity = 0
   let time = 0
-  let lastContourSignature = null
 
   /** Runs immediately before `main.js` calls `view.render()` for this frame. */
   function debugCheckGeometry() {
@@ -1381,13 +1340,11 @@ export function createPersona({
 
     dust.uniforms.uTime.value = time
     headDust.uniforms.uTime.value = time
-    faceSurface.uniforms.uTime.value = time
-    ghost.uniforms.uTime.value = time
+    faceDust.uniforms.uTime.value = time
 
     dust.uniforms.uOpacity.value = opacity * torsoSpec.dustOpacity
     headDust.uniforms.uOpacity.value = opacity * spec.headDustOpacity
-    faceSurface.uniforms.uOpacity.value = opacity * faceSpec.faceSurfaceOpacity
-    ghost.uniforms.uOpacity.value = opacity * faceSpec.faceOpacity
+    faceDust.uniforms.uOpacity.value = opacity * faceSpec.faceDustOpacity
 
     for (const { arms, cap } of handUnits) {
       for (const arm of arms) {
@@ -1397,13 +1354,6 @@ export function createPersona({
       cap.uniforms.uTime.value = time
       cap.uniforms.uOpacity.value = opacity * handSpec.handCapOpacity
     }
-
-    // The surface coalesces as it appears and burns away piece by piece as it leaves.
-    faceSurface.uniforms.uDissolve.value = THREE.MathUtils.lerp(
-      faceSpec.faceDissolveAtZero,
-      faceSpec.faceDissolve,
-      opacity,
-    )
 
     // Re-apply the dust uniforms every frame so the debug sliders can tune them live.
     // `particleCount` and the colours are structural / init-time values.
@@ -1433,68 +1383,42 @@ export function createPersona({
       cap.uniforms.uPointScale.value = handSpec.handCapSize * pixelRatio
     }
 
-    // Re-apply the face uniforms every frame so the debug sliders can tune them live. `faceSubdiv`
-    // is structural (it sizes the geometry), so it still needs a reload.
-    ghost.uniforms.uGlow.value = faceSpec.facePointAlpha
-    ghost.uniforms.uPointScale.value = faceSpec.facePointSize * pixelRatio
-    ghost.uniforms.uJitter.value = faceSpec.faceJitter
-    ghost.uniforms.uColor.value.set(faceSpec.faceColor)
-
-    faceSurface.uniforms.uSoftness.value = faceSpec.faceDissolveSoftness
-    faceSurface.uniforms.uNoiseScale.value = faceSpec.faceNoiseScale
-    faceSurface.uniforms.uNoiseSpeed.value = faceSpec.faceNoiseSpeed
-    faceSurface.uniforms.uFadeStart.value = faceSpec.faceFadeStart
-    faceSurface.uniforms.uColor.value.set(faceSpec.faceColor)
+    // Re-apply the face uniforms every frame so the debug sliders can tune them live. Structural
+    // values (`faceDustCount`) still need a reload.
+    faceDust.uniforms.uPointScale.value = faceSpec.faceDustSize * pixelRatio
+    faceDust.uniforms.uColor.value.set(faceSpec.faceColor)
 
     if (!root.visible) {
+      const hidden = { visible: false, reason: 'persona-hidden' }
       return {
         visible: false,
         opacity,
-        contour: { visible: false, reason: 'persona-hidden' },
-        surface: { visible: false, reason: 'persona-hidden' },
+        face: hidden,
         hands: handUnits.map(() => ({ visible: false, reason: 'persona-hidden', cap: false })),
       }
     }
 
     if (landmarks) updateTorso(landmarks, view, torso, dust.uniforms)
-    const surfaceStatus = updateFaceSurface(faceLandmarks, faceSurface, view, faceSpec.faceDepth)
-    const contourStatus = updateGhostFace(faceLandmarks, ghost, view, faceSpec.faceDepth)
-    updateHeadDust(contourStatus, headDust, faceSpec.faceDepth)
+
+    const faceStatus = updateFaceDust(
+      faceLandmarks,
+      faceDust,
+      faceRegions,
+      view,
+      faceSpec.faceDepth,
+      time,
+      faceSpec,
+    )
+
+    updateHeadDust(faceStatus, headDust, faceSpec.faceDepth)
     const hands = updateHands(landmarks, handLandmarks, handUnits, view, handSpec)
 
     debugCheckGeometry()
 
-    // Log once whenever the contour's verdict changes (no-face → ok, or a new bad landmark) so
-    // the raw offending value is visible in the console without staring at the readout.
-    if (DEV) {
-      const signature = contourStatus.bad
-        ? `${contourStatus.bad.kind} ${contourStatus.bad.index ?? ''}.${contourStatus.bad.field ?? ''}=${contourStatus.bad.value ?? ''}`
-        : contourStatus.reason
-      if (signature !== lastContourSignature) {
-        lastContourSignature = signature
-        if (contourStatus.bad?.kind === 'landmark') {
-          console.warn(
-            `persona/contour: non-finite landmark[${contourStatus.bad.index}].${contourStatus.bad.field} =`,
-            contourStatus.bad.value,
-            'raw:',
-            contourStatus.bad.raw,
-          )
-        } else if (contourStatus.bad?.kind === 'view') {
-          console.warn('persona/contour: non-finite view', {
-            halfWidth: contourStatus.bad.halfWidth,
-            halfHeight: contourStatus.bad.halfHeight,
-          })
-        } else {
-          console.debug(`persona/contour: ${signature}`)
-        }
-      }
-    }
-
     return {
       visible: root.visible,
       opacity,
-      contour: contourStatus,
-      surface: surfaceStatus,
+      face: faceStatus,
       hands,
     }
   }
@@ -1512,10 +1436,8 @@ export function createPersona({
       cap.points.geometry.dispose()
       cap.points.material.dispose()
     }
-    faceSurface.geometry.dispose()
-    faceSurface.mesh.material.dispose()
-    ghost.geometry.dispose()
-    ghost.points.material.dispose()
+    faceDust.geometry.dispose()
+    faceDust.points.material.dispose()
   }
 
   // `face` / `torso` / `hand` are the live, mutable specs: the debug sliders write straight into

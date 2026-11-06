@@ -17,7 +17,7 @@ The `vision/` layer is implemented (`camera.js`, `pose.js`, `gesture.js`, `face.
 `fileset.js` for the shared WASM runtime) along with `config.js` and the `state.js` state
 machine. The `scene/` layer now renders the persona: `renderer.js` owns the black canvas and an
 orthographic camera, and `persona.js` draws the wispy shoulder→hip dust silhouette plus a
-tesselated, noise-dissolved face surface and ghost-face contour points. `main.js` boots the
+filled face-dust cloud carved around the eyes, nose and mouth. `main.js` boots the
 models and drives the persona from the state machine. `audio/` is still to be written. Each
 concern — vision, state machine, scene, audio — lives in its own folder so the interaction
 loop can be traced from one file to the next.
@@ -42,12 +42,12 @@ alter-ego/
 │   │   ├── fileset.js          # shared tasks-vision WASM runtime, loaded once
 │   │   ├── pose.js             # PoseLandmarker + personDistance (metres to camera)
 │   │   ├── gesture.js          # GestureRecognizer + EXTEND_HAND (closeness/depth/stillness) trigger
-│   │   └── face.js             # FaceLandmarker + the face-oval contour
+│   │   └── face.js             # FaceLandmarker + tesselation and carve regions
 │   ├── dev/
 │   │   └── stateHarness.js     # camera-free state-machine verification (scripted timelines)
 │   ├── scene/
 │   │   ├── renderer.js         # Three.js renderer, orthographic camera, resize
-│   │   ├── persona.js          # shoulder→hip dust cloud + tesselated face surface + ghost face
+│   │   ├── persona.js          # shoulder→hip dust + carved face dust + hand/head dust
 │   │   └── effects/
 │   │       └── glassBreak.js   # glass-break visual effect (not written yet)
 │   └── audio/
@@ -65,7 +65,6 @@ Notes:
   `dev/stateHarness.js` verify it without a camera.
 - `scene/persona.js` maps normalised landmarks onto an orthographic frame (flipped horizontally
   to line up with the mirror) and exists only outside IDLE: a shoulder→hip dust cloud forms the
-  torso silhouette, a tesselated face surface dissolves with noise in front of it, and the
-  ghost-face contour points sit on top. All colours, opacity, noise and ramp timings live in
-  `PERSONA` in `config.js`.
+  torso silhouette, and a drifting face-dust cloud is carved around the eyes, nose and mouth in
+  front of it. All colours, opacity, drift and ramp timings live in `PERSONA` in `config.js`.
 - Keep the page background pure black (`#000000`); no HTML chrome around the canvas.

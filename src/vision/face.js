@@ -3,16 +3,6 @@ import { DELEGATE, FACE, MODEL_PATHS } from '../config.js'
 import { getVisionFileset } from './fileset.js'
 
 /**
- * The face-oval contour, as MediaPipe's list of landmark-index connections.
- *
- * BlazePose only reports ~11 face points, which cannot outline a face. The FaceLandmarker
- * returns the full 478-point mesh, and this oval is the boundary of it: the jaw, cheeks and
- * forehead in one closed chain. The persona draws it as line segments, so the connection pairs
- * can be used directly without re-ordering them.
- */
-export const FACE_OVAL = FaceLandmarker.FACE_LANDMARKS_FACE_OVAL
-
-/**
  * MediaPipe's canonical nose outline.
  *
  * tasks-vision exposes the eyes, lips, brows and oval as static connection arrays, but the nose
@@ -47,19 +37,60 @@ export const FACE_TRIANGLES = (() => {
 })()
 
 /**
- * The contours that make up the ghostly face. They are all baked into one point cloud with one
- * material so they read as a single face, not a separate wireframe per feature.
+ * Turn a MediaPipe contour connection list into an ordered list of landmark indices.
+ *
+ * The contour arrays are `(start, end)` pairs in ring order, but walking the adjacency (rather
+ * than trusting the pairs' order/orientation) keeps this robust to either direction and returns
+ * every point exactly once. Open paths simply terminate at their endpoint.
  */
-export const FACE_FEATURES = [
-  { name: 'oval', connections: FaceLandmarker.FACE_LANDMARKS_FACE_OVAL },
-  { name: 'lips', connections: FaceLandmarker.FACE_LANDMARKS_LIPS },
-  { name: 'leftEye', connections: FaceLandmarker.FACE_LANDMARKS_LEFT_EYE },
-  { name: 'rightEye', connections: FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE },
-  { name: 'nose', connections: FACE_NOSE },
+function orderedRing(connections) {
+  if (!connections.length) return []
+
+  const neighbours = new Map()
+  for (const { start, end } of connections) {
+    if (!neighbours.has(start)) neighbours.set(start, [])
+    if (!neighbours.has(end)) neighbours.set(end, [])
+    neighbours.get(start).push(end)
+    neighbours.get(end).push(start)
+  }
+
+  const ring = []
+  const seen = new Set()
+  let prev = null
+  let current = connections[0].start
+
+  while (current != null && !seen.has(current)) {
+    ring.push(current)
+    seen.add(current)
+    const around = neighbours.get(current) ?? []
+    const next = around.find((index) => index !== prev)
+    prev = current
+    current = next
+  }
+
+  return ring
+}
+
+/**
+ * The regions carved out of the face dust, as closed polygons of landmark indices.
+ *
+ * The eyes and lips are already closed contours. The nose is not (MediaPipe only exposes it as a
+ * tangled set of segments, with the tip shared by several), so `hull` tells the renderer to take
+ * the convex hull of its landmarks instead — a stable closed outline that still hugs the nose.
+ */
+export const FACE_REGIONS = [
+  { name: 'leftEye', indices: orderedRing(FaceLandmarker.FACE_LANDMARKS_LEFT_EYE) },
+  { name: 'rightEye', indices: orderedRing(FaceLandmarker.FACE_LANDMARKS_RIGHT_EYE) },
+  { name: 'lips', indices: orderedRing(FaceLandmarker.FACE_LANDMARKS_LIPS) },
+  {
+    name: 'nose',
+    indices: [...new Set(FACE_NOSE.flatMap(({ start, end }) => [start, end]))],
+    hull: true,
+  },
 ]
 
 /**
- * Builds the face model behind the persona's contour.
+ * Builds the face model that supplies the persona's face mesh.
  *
  * Reuses the shared tasks-vision WASM runtime (see `fileset.js`) and the same VIDEO-mode
  * contract as the pose and hand models: strictly increasing timestamps, never re-submitting a

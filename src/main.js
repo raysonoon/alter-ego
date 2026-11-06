@@ -15,7 +15,7 @@ import {
   personDistance,
   shoulderSpan,
 } from './vision/pose.js'
-import { createFaceLandmarker, FACE_FEATURES, FACE_TRIANGLES } from './vision/face.js'
+import { createFaceLandmarker, FACE_REGIONS, FACE_TRIANGLES } from './vision/face.js'
 import { createRenderer } from './scene/renderer.js'
 import { createPersona } from './scene/persona.js'
 
@@ -58,22 +58,16 @@ function clearStatus() {
 }
 
 /**
- * Live face-tuning sliders. Each writes straight into the persona's mutable `face` spec, which
- * `persona.update()` re-applies every frame. Structural values (`faceSubdiv`) and the colour are
- * deliberately excluded — they need a rebuild / a different control.
+ * Live face-dust tuning sliders. Each writes straight into the persona's mutable `face` spec,
+ * which `persona.update()` re-applies every frame. `faceDustCount` is structural, so it needs a
+ * reload.
  */
-const FACE_SLIDERS = [
-  { key: 'faceOpacity', label: 'opacity', min: 0, max: 1, step: 0.01 },
-  { key: 'faceSurfaceOpacity', label: 'surface', min: 0, max: 1, step: 0.01 },
-  { key: 'faceDissolve', label: 'dissolve', min: 0, max: 1, step: 0.01 },
-  { key: 'faceDissolveAtZero', label: 'dissolve 0', min: 0, max: 1, step: 0.01 },
-  { key: 'faceDissolveSoftness', label: 'softness', min: 0.01, max: 1, step: 0.01 },
-  { key: 'faceNoiseScale', label: 'noise scale', min: 0.5, max: 12, step: 0.1 },
-  { key: 'faceNoiseSpeed', label: 'noise speed', min: 0, max: 0.5, step: 0.005 },
-  { key: 'faceFadeStart', label: 'fade start', min: 0, max: 1, step: 0.01 },
-  { key: 'facePointSize', label: 'point size', min: 1, max: 20, step: 0.5 },
-  { key: 'facePointAlpha', label: 'point alpha', min: 0, max: 1, step: 0.01 },
-  { key: 'faceJitter', label: 'jitter', min: 0, max: 0.05, step: 0.001 },
+const FACE_DUST_SLIDERS = [
+  { key: 'faceDustOpacity', label: 'opacity', min: 0, max: 1, step: 0.01 },
+  { key: 'faceDustSize', label: 'point size', min: 1, max: 20, step: 0.5 },
+  { key: 'faceDustDrift', label: 'drift', min: 0, max: 0.1, step: 0.001 },
+  { key: 'faceDustRise', label: 'rise', min: 0, max: 0.05, step: 0.001 },
+  { key: 'faceCarveSoftness', label: 'carve softness', min: 0, max: 0.2, step: 0.005 },
   { key: 'faceDepth', label: 'depth', min: -0.2, max: 0.3, step: 0.01 },
 ]
 
@@ -171,7 +165,7 @@ function getDebugStack() {
 }
 
 function createFaceControls(persona) {
-  getDebugStack().appendChild(createSliderPanel('face', FACE_SLIDERS, persona.face))
+  getDebugStack().appendChild(createSliderPanel('face', FACE_DUST_SLIDERS, persona.face))
 }
 
 function createTorsoControls(persona) {
@@ -191,8 +185,8 @@ const persona = createPersona({
   // `renderer.view` is the shared mirror-frame metrics object; the persona must not receive the
   // whole renderer API or `halfWidth`/`halfHeight` read as undefined.
   view: renderer.view,
-  faceFeatures: FACE_FEATURES,
   faceTriangles: FACE_TRIANGLES,
+  faceRegions: FACE_REGIONS,
   handCount: GESTURE.numHands,
   pixelRatio: renderer.renderer.getPixelRatio(),
 })
@@ -297,23 +291,16 @@ function tick() {
     ? `${(APPROACH.distanceThreshold / (span.real / span.apparent)).toFixed(2)} if you stand at ${APPROACH.distanceThreshold} m`
     : '—'
 
-  const contour = personaFrame?.contour
-  const contourBad = contour?.bad
-    ? contour.bad.kind === 'view'
-      ? `  BAD VIEW halfWidth=${contour.bad.halfWidth} halfHeight=${contour.bad.halfHeight}`
-      : `  BAD landmark[${contour.bad.index}].${contour.bad.field}=${String(contour.bad.value)}`
+  const faceStatus = personaFrame?.face
+  const faceBad = faceStatus?.bad
+    ? faceStatus.bad.kind === 'view'
+      ? `  BAD VIEW halfWidth=${faceStatus.bad.halfWidth} halfHeight=${faceStatus.bad.halfHeight}`
+      : `  BAD landmark[${faceStatus.bad.index}].${faceStatus.bad.field}=${String(faceStatus.bad.value)}`
     : ''
-  const contourLine = contour
-    ? contour.visible
-      ? `visible  pts ${contour.written}/${contour.total}  lm ${contour.landmarks}  w ${contour.width.toFixed(3)}  h ${contour.height.toFixed(3)}  @ ${contour.x.toFixed(2)},${contour.y.toFixed(2)}${contourBad}`
-      : `hidden (${contour.reason})  pts ${contour.total ?? '?'}  lm ${contour.landmarks ?? 0}${contourBad}`
-    : '—'
-
-  const surface = personaFrame?.surface
-  const surfaceLine = surface
-    ? surface.visible
-      ? `visible  verts ${surface.written}/${surface.total}`
-      : `hidden (${surface.reason})`
+  const faceLine = faceStatus
+    ? faceStatus.visible
+      ? `visible  pts ${faceStatus.written}/${faceStatus.total}  w ${(faceStatus.width ?? 0).toFixed(3)}  h ${(faceStatus.height ?? 0).toFixed(3)}  @ ${(faceStatus.x ?? 0).toFixed(2)},${(faceStatus.y ?? 0).toFixed(2)}${faceBad}`
+      : `hidden (${faceStatus.reason})${faceBad}`
     : '—'
 
   const handsLine = personaFrame?.hands?.length
@@ -335,9 +322,8 @@ function tick() {
     `nose      ${format(landmarks?.[POSE_LANDMARKS.NOSE])}`,
     `shoulder  ${format(landmarks?.[POSE_LANDMARKS.LEFT_SHOULDER])}`,
     `face      ${faceLandmarks ? `tracked (${faceLandmarks.length} landmarks)` : face ? 'no face' : 'model off'}`,
-    `persona   op ${(personaFrame?.opacity ?? 0).toFixed(2)}  ${personaFrame?.visible ? 'shown' : 'hidden'}  ${FACE_FEATURES.length} features`,
-    `contour   ${contourLine}`,
-    `surface   ${surfaceLine}`,
+    `persona   op ${(personaFrame?.opacity ?? 0).toFixed(2)}  ${personaFrame?.visible ? 'shown' : 'hidden'}  ${FACE_REGIONS.length} carve regions`,
+    `faceDust  ${faceLine}`,
     `handDust  ${handsLine}`,
     `hand      ${handLandmarks ? `spread ${spread.toFixed(3)} (${tips} tips) / needs ${EXTEND_HAND.minSpread}` : 'none'}`,
     `depth     ${handLandmarks ? `z-spread ${zSpread.toFixed(3)} / needs ${EXTEND_HAND.minZSpread}` : '—'}`,
@@ -355,8 +341,8 @@ async function boot() {
     createPoseLandmarker(),
     createGestureRecognizer(),
     createFaceLandmarker().catch((error) => {
-      // The face contour is one visual layer; if it fails the rest of the prop still runs.
-      console.warn('FaceLandmarker failed to load; the face contour will stay hidden.', error)
+      // The face is one visual layer; if it fails the rest of the prop still runs.
+      console.warn('FaceLandmarker failed to load; the face dust will stay hidden.', error)
       return null
     }),
   ])

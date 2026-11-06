@@ -11,7 +11,8 @@ Interaction loop (IDLE → APPROACH → EXIT TRIGGER) and hardware/optics detail
 ## Current state — read before editing `src/`
 - The `vision/` layer is built: `camera.js` (getUserMedia), `pose.js` (PoseLandmarker plus
   `personDistance`, the metres-to-camera estimate), `gesture.js` (GestureRecognizer + the
-  EXTEND_HAND trigger), `face.js` (FaceLandmarker plus the face-oval contour), and `fileset.js`,
+  EXTEND_HAND trigger), `face.js` (FaceLandmarker plus the face tesselation and carve regions),
+  and `fileset.js`,
   which shares one WASM runtime across all three models instead of letting each instantiate its
   own copy. Tunables live in `src/config.js` (`POSE`, `GESTURE`, `FACE`, `PERSONA`).
 - `src/state.js` holds the IDLE → APPROACH → EXIT state machine. It is pure and
@@ -23,8 +24,8 @@ Interaction loop (IDLE → APPROACH → EXIT TRIGGER) and hardware/optics detail
   and the extend-hand trigger into the state machine, and drives the scene each frame.
 - The `scene/` layer is built: `renderer.js` owns the black canvas and an orthographic camera
   aligned to the mirror; `persona.js` renders the wispy, dusty figure — a shoulder→hip dust
-  cloud, plus a tesselated face surface and ghost-face contour points with a head-dust halo —
-  and only shows outside IDLE. It consumes normalised landmarks only (flipped horizontally to
+  cloud, a filled face-dust cloud carved around the eyes/nose/mouth, and a head-dust halo — and
+  only shows outside IDLE. It consumes normalised landmarks only (flipped horizontally to
   match the mirror) and is tuned through `PERSONA` in `src/config.js`. `src/audio/` and
   `scene/effects/glassBreak.js` are still to be written and will hang off the state machine's
   events.
