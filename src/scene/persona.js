@@ -6,15 +6,51 @@ import { POSE_LANDMARKS } from '../vision/pose.js'
 const DEV = Boolean(import.meta.env?.DEV)
 
 /**
+ * Default tunables for the face layers. They mirror the `PERSONA` config so the current values
+ * stay the defaults, but they are also exposed as the overridable `face` parameter of
+ * `createPersona` — pass e.g. `face: { faceOpacity: 0.7 }` to adjust at the call site.
+ */
+export const FACE_DEFAULTS = {
+  faceColor: PERSONA.faceColor,
+  faceOpacity: PERSONA.faceOpacity,
+  faceSubdiv: PERSONA.faceSubdiv,
+  facePointSize: PERSONA.facePointSize,
+  faceJitter: PERSONA.faceJitter,
+  facePointAlpha: PERSONA.facePointAlpha,
+  faceSurfaceOpacity: PERSONA.faceSurfaceOpacity,
+  faceDissolve: PERSONA.faceDissolve,
+  faceDissolveAtZero: PERSONA.faceDissolveAtZero,
+  faceDissolveSoftness: PERSONA.faceDissolveSoftness,
+  faceNoiseScale: PERSONA.faceNoiseScale,
+  faceNoiseSpeed: PERSONA.faceNoiseSpeed,
+  faceFadeStart: PERSONA.faceFadeStart,
+  faceDepth: PERSONA.faceDepth,
+}
+
+/**
+ * Default tunables for the torso dust cloud. They mirror `PERSONA` so the current values stay the
+ * defaults, but they are also exposed as the overridable `torso` parameter of `createPersona` —
+ * pass e.g. `torso: { drift: 0.1 }` to adjust at the call site.
+ */
+export const TORSO_DEFAULTS = {
+  particleCount: PERSONA.particleCount,
+  particleRadius: PERSONA.particleRadius,
+  dustColor: PERSONA.dustColor,
+  dustOpacity: PERSONA.dustOpacity,
+  dustSpread: PERSONA.dustSpread,
+  depth: PERSONA.depth,
+  drift: PERSONA.drift,
+  rise: PERSONA.rise,
+}
+
+/**
  * The persona: a wispy, dusty silhouette that mirrors the player.
  *
- * Three layers share the frame and one opacity ramp:
- *   - `body`   — a shoulder→hip mesh whose fragment shader burns the silhouette into animated
- *                noise, so the torso reads as smoke rather than a solid shape;
- *   - `dust`   — points seeded through the same volume, drifting on their own noise, so the
- *                smoke looks like it is unravelling into particles;
- *   - `face`   — the FaceLandmarker's face-oval contour, drawn as line segments just in front
- *                of the body in a slightly brighter cool tone.
+ * Layers share the frame and one opacity ramp:
+ *   - `dust`   — points seeded across the shoulder→hip volume, drifting on their own noise so the
+ *                torso reads as a wispy, dusty silhouette;
+ *   - `face`   — the tesselated face surface plus the ghost-face contour points, with a dust halo
+ *                around the head.
  *
  * Only normalised landmark coordinates are used for geometry: they are what the mirror shows,
  * so mapping them straight onto the orthographic frame keeps the figure aligned with the
@@ -52,73 +88,41 @@ const NOISE_GLSL = /* glsl */ `
   }
 `
 
-const BODY_VERTEX = /* glsl */ `
-  varying vec2 vUv;
-
-  uniform float uTime;
-  uniform float uShoulderWidth;
-  uniform float uHipWidth;
-  uniform float uTorsoHeight;
-  uniform float uNoise;
-  uniform float uDisplace;
-
-  ${NOISE_GLSL}
-
-  void main() {
-    vUv = uv;
-
-    // uv.y is 0 at the hips and 1 at the shoulders, so the trapezoid narrows or widens
-    // between the two measured spans.
-    float width = mix(uHipWidth, uShoulderWidth, uv.y);
-
-    vec3 p;
-    p.x = position.x * width;
-    p.y = position.y * uTorsoHeight;
-    p.z = 0.0;
-
-    // Slow billow so the silhouette is never a flat cut-out.
-    float n = fbm(vec2(position.x, position.y) * uNoise - vec2(0.0, uTime * 0.15));
-    p.z += (n - 0.5) * uDisplace;
-    p.x += (n - 0.5) * uDisplace * 0.6;
-
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+/**
+ * 3D value noise. The extra axis lets time be a real dimension, so dissolve patterns morph in
+ * place instead of scrolling a 2D slice across the surface. Same ~[0, 0.94] range as `fbm`, so
+ * existing dissolve thresholds carry over.
+ */
+const NOISE3D_GLSL = /* glsl */ `
+  float hash31(vec3 p) {
+    p = fract(p * 0.3183099 + 0.1);
+    p *= 17.0;
+    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
   }
-`
 
-const BODY_FRAGMENT = /* glsl */ `
-  varying vec2 vUv;
+  float valueNoise3(vec3 x) {
+    vec3 i = floor(x);
+    vec3 f = fract(x);
+    f = f * f * (3.0 - 2.0 * f);
 
-  uniform float uTime;
-  uniform vec3 uColor;
-  uniform float uOpacity;
-  uniform float uDissolve;
-  uniform float uSoftness;
-  uniform vec2 uNoiseScale;
+    // Blend the 8 corners of the cube the sample falls inside.
+    return mix(
+      mix(mix(hash31(i + vec3(0.0, 0.0, 0.0)), hash31(i + vec3(1.0, 0.0, 0.0)), f.x),
+          mix(hash31(i + vec3(0.0, 1.0, 0.0)), hash31(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+      mix(mix(hash31(i + vec3(0.0, 0.0, 1.0)), hash31(i + vec3(1.0, 0.0, 1.0)), f.x),
+          mix(hash31(i + vec3(0.0, 1.0, 1.0)), hash31(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),
+      f.z);
+  }
 
-  ${NOISE_GLSL}
-
-  void main() {
-    vec2 uv = vUv;
-
-    // Two octave sets drift in opposite directions so the fringe never repeats visibly.
-    float n = fbm(uv * uNoiseScale + vec2(0.0, -uTime * 0.13));
-    n = n * 0.7 + fbm(uv * uNoiseScale * 2.4 + vec2(uTime * 0.09, 0.0)) * 0.3;
-
-    // Soft falloff toward the silhouette boundary, so the mesh melts into black rather than
-    // ending on a hard edge.
-    float edgeX = smoothstep(0.0, 0.22, uv.x) * (1.0 - smoothstep(0.78, 1.0, uv.x));
-    float edgeY = smoothstep(0.0, 0.10, uv.y) * (1.0 - smoothstep(0.88, 1.0, uv.y));
-
-    // Carve holes out of the low-noise regions; feathering the cut is what makes it wispy.
-    float burn = smoothstep(uDissolve, uDissolve + uSoftness, n);
-
-    float alpha = uOpacity * edgeX * edgeY * burn;
-    alpha *= mix(0.35, 1.0, n);
-    // Denser at the shoulders, dusting away toward the hips.
-    alpha *= mix(0.55, 1.0, uv.y);
-
-    if (alpha < 0.004) discard;
-    gl_FragColor = vec4(uColor, alpha);
+  float fbm3(vec3 p) {
+    float value = 0.0;
+    float amplitude = 0.5;
+    for (int i = 0; i < 4; i++) {
+      value += amplitude * valueNoise3(p);
+      p = p * 2.02 + 7.13;
+      amplitude *= 0.5;
+    }
+    return value;
   }
 `
 
@@ -137,7 +141,7 @@ const DUST_VERTEX = /* glsl */ `
   uniform float uPointScale;
   uniform float uOpacity;
 
-  ${NOISE_GLSL}
+  ${NOISE3D_GLSL}
 
   void main() {
     float t = position.y + 0.5;
@@ -148,9 +152,9 @@ const DUST_VERTEX = /* glsl */ `
     p.y = position.y * uTorsoHeight;
     p.z = position.z * uDepth;
 
-    // Independent drift per particle, with the seed decorrelating neighbours.
-    float n1 = valueNoise(p.xy * 1.7 + vec2(uTime * 0.22, 0.0) + aSeed);
-    float n2 = valueNoise(p.xy * 1.4 - vec2(0.0, uTime * 0.18) + aSeed * 1.7 + 4.2);
+    // Independent drift per particle; time is the third axis so neighbours flow together.
+    float n1 = valueNoise3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
+    float n2 = valueNoise3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
     p.x += (n1 - 0.5) * uDrift;
     p.y += (n2 - 0.5) * uDrift;
     p.z += (n1 - 0.5) * uDepth;
@@ -174,40 +178,143 @@ const DUST_FRAGMENT = /* glsl */ `
   }
 `
 
-function createBody(spec) {
-  const uniforms = {
-    uTime: { value: 0 },
-    uColor: { value: new THREE.Color(spec.bodyColor) },
-    uOpacity: { value: 0 },
-    uShoulderWidth: { value: 0.5 },
-    uHipWidth: { value: 0.4 },
-    uTorsoHeight: { value: 0.5 },
-    uDissolve: { value: spec.dissolveAtZero },
-    uSoftness: { value: spec.dissolveSoftness },
-    uNoiseScale: { value: new THREE.Vector2(...spec.noiseScale) },
-    uNoise: { value: spec.noiseScale[0] },
-    uDisplace: { value: spec.displace },
+/**
+ * Head dust: a halo of particles whose rest positions are a unit annulus around the face. The
+ * shader scales that ring by the measured face radius and lets it drift/shift upward, so the
+ * same dust that lifts off the body also gathers around the head.
+ */
+const HEAD_DUST_VERTEX = /* glsl */ `
+  attribute float aSeed;
+  attribute float aSize;
+
+  uniform float uTime;
+  uniform float uRadius;
+  uniform float uSpread;
+  uniform float uDepth;
+  uniform float uDrift;
+  uniform float uRise;
+  uniform float uPointScale;
+  uniform float uOpacity;
+
+  ${NOISE3D_GLSL}
+
+  void main() {
+    // position.xy is seeded in a unit annulus; scale it to the face radius, then overshoot so
+    // the dust hugs and spills past the outline rather than filling the face.
+    vec3 p;
+    p.x = position.x * uRadius * uSpread;
+    p.y = position.y * uRadius * uSpread;
+    p.z = position.z * uDepth;
+
+    // Independent drift per particle, plus a slow rise so dust lifts off the head.
+    float n1 = valueNoise3(vec3(p.xy * 2.2 + aSeed, uTime * 0.22));
+    float n2 = valueNoise3(vec3(p.xy * 1.7 + aSeed * 1.7, uTime * 0.18 + 4.2));
+    p.x += (n1 - 0.5) * uDrift;
+    p.y += (n2 - 0.5) * uDrift;
+    p.y += sin(uTime * 0.55 + aSeed * 6.2831) * uRise;
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
   }
+`
 
-  const geometry = new THREE.PlaneGeometry(1, 1, spec.columns, spec.rows)
-  const material = new THREE.ShaderMaterial({
-    uniforms,
-    vertexShader: BODY_VERTEX,
-    fragmentShader: BODY_FRAGMENT,
-    transparent: true,
-    depthTest: false,
-    depthWrite: false,
-    side: THREE.DoubleSide,
-    blending: THREE.NormalBlending,
-  })
+/**
+ * The ghost face is a cloud of soft additive points sampled along every face contour. Points
+ * (not lines) are what make it read as one ghostly face: sparse, soft sprites pool into glowing
+ * strokes instead of hard vector wireframe.
+ */
+const GHOST_VERTEX = /* glsl */ `
+  attribute float aSize;
+  attribute float aSeed;
 
-  const mesh = new THREE.Mesh(geometry, material)
-  mesh.name = 'body'
-  mesh.frustumCulled = false // the shader moves vertices well past the unit bounding sphere
-  mesh.renderOrder = 0
+  uniform float uTime;
+  uniform float uPointScale;
+  uniform float uJitter;
 
-  return { mesh, uniforms }
-}
+  ${NOISE_GLSL}
+
+  void main() {
+    vec3 p = position;
+
+    // Per-point shimmer, so the face drifts like smoke rather than sitting as a rig.
+    float n1 = valueNoise(vec2(aSeed * 91.7, uTime * 0.35));
+    float n2 = valueNoise(vec2(aSeed * 37.3 + 4.1, uTime * 0.28));
+    p.x += (n1 - 0.5) * uJitter;
+    p.y += (n2 - 0.5) * uJitter;
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = aSize * uPointScale;
+  }
+`
+
+const GHOST_FRAGMENT = /* glsl */ `
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  uniform float uGlow;
+
+  void main() {
+    // Soft radial sprite; additive blending lets overlapping points pool into a glow.
+    float d = length(gl_PointCoord - 0.5);
+    float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uOpacity * uGlow;
+    if (alpha < 0.003) discard;
+    gl_FragColor = vec4(uColor, alpha);
+  }
+`
+
+/**
+ * The tesselated face surface: a filled, translucent mask whose alpha is carved by a
+ * face-anchored procedural noise field. Raising `uDissolve` burns away the low-noise regions
+ * first, so the surface vanishes piece by piece instead of fading uniformly.
+ */
+const FACE_SURFACE_VERTEX = /* glsl */ `
+  attribute vec2 aCoord;
+  varying vec2 vUv;
+  varying float vEdge;
+
+  uniform vec2 uCenter;
+  uniform float uRadius;
+
+  void main() {
+    // aCoord is the landmark's normalised image position, so the dissolve pattern sticks to the
+    // face as it moves rather than sliding across the mirror.
+    vUv = aCoord;
+
+    // Normalised distance from the face centre, used to fade the mask out at its boundary.
+    vEdge = uRadius > 0.0 ? distance(position.xy, uCenter) / uRadius : 0.0;
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`
+
+const FACE_SURFACE_FRAGMENT = /* glsl */ `
+  varying vec2 vUv;
+  varying float vEdge;
+
+  uniform float uTime;
+  uniform vec3 uColor;
+  uniform float uOpacity;
+  uniform float uDissolve;
+  uniform float uSoftness;
+  uniform float uNoiseScale;
+  uniform float uNoiseSpeed;
+  uniform float uFadeStart;
+
+  ${NOISE3D_GLSL}
+
+  void main() {
+    // Time is the third axis, so the burn pattern morphs in place instead of sliding across the
+    // face as it would with a drifting 2D slice.
+    float n = fbm3(vec3(vUv * uNoiseScale, uTime * uNoiseSpeed));
+    float burn = smoothstep(uDissolve, uDissolve + uSoftness, n);
+
+    // Solid through the centre, melting to nothing at the face boundary.
+    float fade = 1.0 - smoothstep(uFadeStart, 1.0, vEdge);
+
+    float alpha = uOpacity * burn * fade;
+    if (alpha < 0.004) discard;
+    gl_FragColor = vec4(uColor, alpha);
+  }
+`
 
 function createDust(spec, pixelRatio) {
   const count = spec.particleCount
@@ -260,27 +367,166 @@ function createDust(spec, pixelRatio) {
   return { points, uniforms }
 }
 
-function createFaceContour(faceOval, spec) {
-  const count = Math.max(faceOval.length * 2, 2)
-  const geometry = new THREE.BufferGeometry()
-  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3))
+function createHeadDust(spec, pixelRatio) {
+  const count = spec.headDustCount
+  const positions = new Float32Array(count * 3)
+  const seeds = new Float32Array(count)
+  const sizes = new Float32Array(count)
 
-  const material = new THREE.LineBasicMaterial({
-    color: spec.faceColor,
+  for (let i = 0; i < count; i += 1) {
+    // Seed an annulus (0.55–1.0 of the unit radius) so the halo hugs and spreads past the face.
+    const angle = Math.random() * Math.PI * 2
+    const radius = 0.55 + Math.random() * 0.45
+    positions[i * 3] = Math.cos(angle) * radius
+    positions[i * 3 + 1] = Math.sin(angle) * radius
+    positions[i * 3 + 2] = Math.random() - 0.5
+    seeds[i] = Math.random()
+    sizes[i] = 0.4 + Math.random() * 0.9
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uColor: { value: new THREE.Color(spec.headDustColor) },
+    uOpacity: { value: 0 },
+    uRadius: { value: 0.2 },
+    uSpread: { value: spec.headDustSpread },
+    uDepth: { value: spec.depth },
+    uDrift: { value: spec.headDustDrift },
+    uRise: { value: spec.headDustRise },
+    uPointScale: { value: spec.headDustSize * pixelRatio },
+  }
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: HEAD_DUST_VERTEX,
+    fragmentShader: DUST_FRAGMENT,
     transparent: true,
-    opacity: 0,
     depthTest: false,
     depthWrite: false,
     blending: THREE.AdditiveBlending,
   })
 
-  const line = new THREE.LineSegments(geometry, material)
-  line.name = 'face'
-  line.frustumCulled = false
-  line.renderOrder = 2
-  line.visible = false
+  const points = new THREE.Points(geometry, material)
+  points.name = 'headDust'
+  points.frustumCulled = false
+  points.renderOrder = 1
+  points.visible = false
 
-  return { line, material, geometry }
+  return { points, uniforms }
+}
+
+function createGhostFace(features, spec, pixelRatio) {
+  // Flatten every feature's connections into sampled points. Sampling along each segment (rather
+  // than only at its endpoints) is what turns the contour into a continuous soft stroke.
+  const start = []
+  const end = []
+  const t = []
+  const featuresPerPoint = []
+  const seeds = []
+  const sizes = []
+
+  for (let f = 0; f < features.length; f += 1) {
+    for (const connection of features[f].connections) {
+      for (let k = 0; k < spec.faceSubdiv; k += 1) {
+        start.push(connection.start)
+        end.push(connection.end)
+        t.push((k + 0.5) / spec.faceSubdiv)
+        featuresPerPoint.push(f)
+        seeds.push(Math.random())
+        sizes.push(0.6 + Math.random() * 0.8)
+      }
+    }
+  }
+
+  const count = start.length
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(count * 3), 3))
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(Float32Array.from(seeds), 1))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(Float32Array.from(sizes), 1))
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uColor: { value: new THREE.Color(spec.faceColor) },
+    uOpacity: { value: 0 },
+    uGlow: { value: spec.facePointAlpha },
+    uPointScale: { value: spec.facePointSize * pixelRatio },
+    uJitter: { value: spec.faceJitter },
+  }
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: GHOST_VERTEX,
+    fragmentShader: GHOST_FRAGMENT,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  })
+
+  const points = new THREE.Points(geometry, material)
+  points.name = 'face'
+  points.frustumCulled = false
+  points.renderOrder = 3 // above the dissolving surface
+  points.visible = false
+
+  return {
+    points,
+    geometry,
+    uniforms,
+    featuresCount: features.length,
+    layout: {
+      count,
+      start: Int16Array.from(start),
+      end: Int16Array.from(end),
+      t: Float32Array.from(t),
+      feature: Int8Array.from(featuresPerPoint),
+    },
+  }
+}
+
+function createFaceSurface(triangles, spec) {
+  const vertexCount = triangles.length ? Math.max(...triangles) + 1 : 0
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(vertexCount * 3), 3))
+  geometry.setAttribute('aCoord', new THREE.BufferAttribute(new Float32Array(vertexCount * 2), 2))
+  geometry.setIndex(new THREE.BufferAttribute(triangles, 1))
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uColor: { value: new THREE.Color(spec.faceColor) },
+    uOpacity: { value: 0 },
+    uDissolve: { value: spec.faceDissolveAtZero },
+    uSoftness: { value: spec.faceDissolveSoftness },
+    uNoiseScale: { value: spec.faceNoiseScale },
+    uNoiseSpeed: { value: spec.faceNoiseSpeed },
+    uCenter: { value: new THREE.Vector2() },
+    uRadius: { value: 0 },
+    uFadeStart: { value: spec.faceFadeStart },
+  }
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: FACE_SURFACE_VERTEX,
+    fragmentShader: FACE_SURFACE_FRAGMENT,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    side: THREE.DoubleSide,
+    blending: THREE.NormalBlending,
+  })
+
+  const mesh = new THREE.Mesh(geometry, material)
+  mesh.name = 'faceSurface'
+  mesh.frustumCulled = false
+  mesh.renderOrder = 2
+  mesh.visible = false
+
+  return { mesh, geometry, uniforms, vertexCount }
 }
 
 const midpoint = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 })
@@ -312,7 +558,7 @@ function toWorld(landmark, view) {
   }
 }
 
-function updateTorso(landmarks, view, torso, bodyUniforms, dustUniforms) {
+function updateTorso(landmarks, view, torso, dustUniforms) {
   const left = toWorld(landmarks[POSE_LANDMARKS.LEFT_SHOULDER], view)
   const right = toWorld(landmarks[POSE_LANDMARKS.RIGHT_SHOULDER], view)
   if (!left || !right) return
@@ -357,21 +603,22 @@ function updateTorso(landmarks, view, torso, bodyUniforms, dustUniforms) {
   }
   torso.rotation.z = Math.atan2(dy, dx)
 
-  for (const uniforms of [bodyUniforms, dustUniforms]) {
-    uniforms.uShoulderWidth.value = shoulderWidth
-    uniforms.uHipWidth.value = hipWidth
-    uniforms.uTorsoHeight.value = torsoHeight
-  }
+  dustUniforms.uShoulderWidth.value = shoulderWidth
+  dustUniforms.uHipWidth.value = hipWidth
+  dustUniforms.uTorsoHeight.value = torsoHeight
 }
 
-function updateFaceContour(faceLandmarks, faceOval, view, contour, depth) {
-  if (!faceOval.length) {
-    contour.line.visible = false
-    return { visible: false, reason: 'no-oval', landmarks: 0, segments: 0, bad: null }
+function updateGhostFace(faceLandmarks, ghost, view, depth) {
+  const { points, layout } = ghost
+  const total = layout.count
+
+  if (!total) {
+    points.visible = false
+    return { visible: false, reason: 'no-features', landmarks: 0, total: 0, bad: null }
   }
   if (!faceLandmarks) {
-    contour.line.visible = false
-    return { visible: false, reason: 'no-face', landmarks: 0, segments: faceOval.length, bad: null }
+    points.visible = false
+    return { visible: false, reason: 'no-face', landmarks: 0, total, bad: null }
   }
 
   // Distinguish a bad view from a bad landmark: a non-finite aspect poisons every mapped point
@@ -379,17 +626,20 @@ function updateFaceContour(faceLandmarks, faceOval, view, contour, depth) {
   const halfWidth = view?.halfWidth
   const halfHeight = view?.halfHeight
   if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
-    contour.line.visible = false
+    points.visible = false
     return {
       visible: false,
       reason: `non-finite view: halfWidth=${halfWidth} halfHeight=${halfHeight}`,
       landmarks: faceLandmarks.length,
-      segments: faceOval.length,
+      total,
       bad: { kind: 'view', halfWidth, halfHeight, view },
     }
   }
 
-  const positions = contour.geometry.attributes.position
+  const positions = ghost.geometry.attributes.position
+  const fullWidth = halfWidth * 2
+  const fullHeight = halfHeight * 2
+
   let minX = Infinity
   let maxX = -Infinity
   let minY = Infinity
@@ -398,31 +648,31 @@ function updateFaceContour(faceLandmarks, faceOval, view, contour, depth) {
   let badCount = 0
   let bad = null
 
-  for (let i = 0; i < faceOval.length; i += 1) {
-    const { start, end } = faceOval[i]
-    const a = faceLandmarks[start]
-    const b = faceLandmarks[end]
+  for (let i = 0; i < total; i += 1) {
+    const landmarkStart = layout.start[i]
+    const landmarkEnd = layout.end[i]
+    const a = faceLandmarks[landmarkStart]
+    const b = faceLandmarks[landmarkEnd]
     if (!a || !b) {
-      contour.line.visible = false
-      return {
-        visible: false,
-        reason: `missing index ${!a ? start : end}`,
-        landmarks: faceLandmarks.length,
-        segments: faceOval.length,
-        bad: null,
-      }
+      badCount += 1
+      continue
     }
 
+    const ax = a.x
+    const ay = a.y
+    const bx = b.x
+    const by = b.y
+
     // Record the exact culprit the first time it appears, but keep drawing the rest of the
-    // contour — one bad landmark should not blank the whole face while we diagnose it.
+    // face — one bad landmark should not blank the whole ghost while we diagnose it.
     if (
-      !Number.isFinite(a.x) || !Number.isFinite(a.y) ||
-      !Number.isFinite(b.x) || !Number.isFinite(b.y)
+      !Number.isFinite(ax) || !Number.isFinite(ay) ||
+      !Number.isFinite(bx) || !Number.isFinite(by)
     ) {
       badCount += 1
       if (!bad) {
-        const useA = !Number.isFinite(a.x) || !Number.isFinite(a.y)
-        const index = useA ? start : end
+        const useA = !Number.isFinite(ax) || !Number.isFinite(ay)
+        const index = useA ? landmarkStart : landmarkEnd
         const landmark = useA ? a : b
         const field = !Number.isFinite(landmark.x) ? 'x' : 'y'
         bad = { kind: 'landmark', index, field, value: landmark[field], raw: landmark }
@@ -430,48 +680,43 @@ function updateFaceContour(faceLandmarks, faceOval, view, contour, depth) {
       continue
     }
 
-    const pa = toWorld(a, view)
-    const pb = toWorld(b, view)
-    if (!pa || !pb) {
-      badCount += 1
-      continue
-    }
+    const t = layout.t[i]
+    const x = (0.5 - (ax + (bx - ax) * t)) * fullWidth
+    const y = (0.5 - (ay + (by - ay) * t)) * fullHeight
 
-    positions.setXYZ(i * 2, pa.x, pa.y, depth)
-    positions.setXYZ(i * 2 + 1, pb.x, pb.y, depth)
+    positions.setXYZ(i, x, y, depth)
 
-    minX = Math.min(minX, pa.x, pb.x)
-    maxX = Math.max(maxX, pa.x, pb.x)
-    minY = Math.min(minY, pa.y, pb.y)
-    maxY = Math.max(maxY, pa.y, pb.y)
+    minX = Math.min(minX, x)
+    maxX = Math.max(maxX, x)
+    minY = Math.min(minY, y)
+    maxY = Math.max(maxY, y)
     written += 1
   }
 
   positions.needsUpdate = written > 0
-  contour.line.visible = written > 0
+  points.visible = written > 0
 
   if (written === 0) {
     return {
       visible: false,
       reason: bad
         ? `non-finite landmark ${bad.index}.${bad.field}=${bad.value}`
-        : 'no segments written',
+        : 'no points written',
       landmarks: faceLandmarks.length,
-      segments: faceOval.length,
+      total,
       bad,
       badCount,
     }
   }
 
-  // World-space bounds, so the readout shows whether the contour is on-frame and what size it
-  // actually is rather than just "visible".
+  // World-space bounds, so the readout shows whether the face is on-frame and what size it is.
   return {
     visible: true,
     reason: bad
       ? `partial: ${badCount} bad (e.g. ${bad.index}.${bad.field}=${bad.value})`
       : 'ok',
     landmarks: faceLandmarks.length,
-    segments: faceOval.length,
+    total,
     written,
     bad,
     badCount,
@@ -480,6 +725,83 @@ function updateFaceContour(faceLandmarks, faceOval, view, contour, depth) {
     x: (minX + maxX) / 2,
     y: (minY + maxY) / 2,
   }
+}
+
+function updateFaceSurface(faceLandmarks, surface, view, depth) {
+  const { mesh, geometry, vertexCount } = surface
+
+  if (!vertexCount) {
+    mesh.visible = false
+    return { visible: false, reason: 'no-triangles' }
+  }
+  if (!faceLandmarks) {
+    mesh.visible = false
+    return { visible: false, reason: 'no-face' }
+  }
+
+  const halfWidth = view?.halfWidth
+  const halfHeight = view?.halfHeight
+  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
+    mesh.visible = false
+    return { visible: false, reason: 'non-finite view' }
+  }
+
+  const position = geometry.attributes.position
+  const coord = geometry.attributes.aCoord
+  const fullWidth = halfWidth * 2
+  const fullHeight = halfHeight * 2
+  let written = 0
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+
+  for (let i = 0; i < vertexCount; i += 1) {
+    const landmark = faceLandmarks[i]
+    if (!landmark) continue
+
+    const { x, y } = landmark
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+
+    const worldX = (0.5 - x) * fullWidth
+    const worldY = (0.5 - y) * fullHeight
+    position.setXYZ(i, worldX, worldY, depth)
+    coord.setXY(i, x, y)
+
+    minX = Math.min(minX, worldX)
+    maxX = Math.max(maxX, worldX)
+    minY = Math.min(minY, worldY)
+    maxY = Math.max(maxY, worldY)
+    written += 1
+  }
+
+  position.needsUpdate = written > 0
+  coord.needsUpdate = written > 0
+  mesh.visible = written > 0
+
+  // Feed the vertex shader the face centre/radius so the mask can fade out at its own boundary.
+  if (written > 0) {
+    surface.uniforms.uCenter.value.set((minX + maxX) / 2, (minY + maxY) / 2)
+    surface.uniforms.uRadius.value = Math.max(maxX - minX, maxY - minY) / 2
+  }
+
+  return { visible: mesh.visible, written, total: vertexCount }
+}
+
+function updateHeadDust(faceStatus, headDust, depth) {
+  const radius = faceStatus?.visible
+    ? Math.max(faceStatus.width, faceStatus.height) * 0.5
+    : 0
+
+  if (!(radius > 1e-4)) {
+    headDust.points.visible = false
+    return
+  }
+
+  // Reuse the ghost-face bounds: x/y is the face centre, width/height its world size.
+  headDust.points.position.set(faceStatus.x, faceStatus.y, depth)
+  headDust.uniforms.uRadius.value = radius
+  headDust.points.visible = true
 }
 
 /**
@@ -505,16 +827,26 @@ function findNonFiniteVertex(geometry) {
 /**
  * @param {object} options
  * @param {{ halfWidth: number, halfHeight: number }} options.view mutable mirror-frame metrics
- * @param {Array<{ start: number, end: number }>} options.faceOval face-oval landmark connections
+ * @param {Array<{ name: string, connections: Array<{start:number,end:number}> }>} options.faceFeatures
+ * @param {Uint16Array|number[]} [options.faceTriangles] tesselation triangle indices
  * @param {typeof PERSONA} [options.spec]
+ * @param {Partial<typeof FACE_DEFAULTS>} [options.face] per-call face-layer overrides
+ * @param {Partial<typeof TORSO_DEFAULTS>} [options.torso] per-call torso-layer overrides
  * @param {number} [options.pixelRatio] device pixel ratio for point sizing
  */
 export function createPersona({
   view,
-  faceOval = [],
+  faceFeatures = [],
+  faceTriangles = [],
   spec = PERSONA,
+  face = {},
+  torso: torsoOverrides = {},
   pixelRatio = Math.min(globalThis.devicePixelRatio || 1, 2),
 }) {
+  // Face/torso layers read from a merged spec so any value can be overridden at the call site,
+  // while everything not passed falls back to the current config values.
+  const faceSpec = { ...FACE_DEFAULTS, ...face }
+  const torsoSpec = { ...TORSO_DEFAULTS, ...torsoOverrides }
   // Guard against passing the renderer API instead of its `view` metrics (a silent mismatch:
   // halfWidth/halfHeight read as undefined and nothing maps).
   if (!Number.isFinite(view?.halfWidth) || !Number.isFinite(view?.halfHeight)) {
@@ -529,18 +861,25 @@ export function createPersona({
   const torso = new THREE.Group()
   root.add(torso)
 
-  const body = createBody(spec)
-  const dust = createDust(spec, pixelRatio)
-  torso.add(body.mesh)
+  const dust = createDust(torsoSpec, pixelRatio)
   torso.add(dust.points)
 
-  const contour = createFaceContour(faceOval, spec)
-  root.add(contour.line)
+  const faceSurface = createFaceSurface(faceTriangles, faceSpec)
+  root.add(faceSurface.mesh)
+
+  const ghost = createGhostFace(faceFeatures, faceSpec, pixelRatio)
+  root.add(ghost.points)
+
+  // A separate halo around the head; it lives in root (not the torso group) because it follows
+  // the face, not the shoulders.
+  const headDust = createHeadDust(spec, pixelRatio)
+  root.add(headDust.points)
 
   const layers = [
-    { name: 'body', object: body.mesh },
     { name: 'dust', object: dust.points },
-    { name: 'face', object: contour.line },
+    { name: 'headDust', object: headDust.points },
+    { name: 'faceSurface', object: faceSurface.mesh },
+    { name: 'face', object: ghost.points },
   ]
   const reported = new Set()
 
@@ -588,22 +927,57 @@ export function createPersona({
 
     root.visible = opacity > 0.002
 
-    body.uniforms.uTime.value = time
     dust.uniforms.uTime.value = time
+    headDust.uniforms.uTime.value = time
+    faceSurface.uniforms.uTime.value = time
+    ghost.uniforms.uTime.value = time
 
-    body.uniforms.uOpacity.value = opacity * spec.bodyOpacity
-    dust.uniforms.uOpacity.value = opacity * spec.dustOpacity
-    contour.material.opacity = opacity * spec.faceOpacity
+    dust.uniforms.uOpacity.value = opacity * torsoSpec.dustOpacity
+    headDust.uniforms.uOpacity.value = opacity * spec.headDustOpacity
+    faceSurface.uniforms.uOpacity.value = opacity * faceSpec.faceSurfaceOpacity
+    ghost.uniforms.uOpacity.value = opacity * faceSpec.faceOpacity
 
-    // As it coalesces the smoke closes up; on the way out it thins into wisps.
-    body.uniforms.uDissolve.value = THREE.MathUtils.lerp(spec.dissolveAtZero, spec.dissolve, opacity)
+    // The surface coalesces as it appears and burns away piece by piece as it leaves.
+    faceSurface.uniforms.uDissolve.value = THREE.MathUtils.lerp(
+      faceSpec.faceDissolveAtZero,
+      faceSpec.faceDissolve,
+      opacity,
+    )
+
+    // Re-apply the dust uniforms every frame so the debug sliders can tune them live.
+    // `particleCount` and the colours are structural / init-time values.
+    dust.uniforms.uSpread.value = torsoSpec.dustSpread
+    dust.uniforms.uDepth.value = torsoSpec.depth
+    dust.uniforms.uDrift.value = torsoSpec.drift
+    dust.uniforms.uRise.value = torsoSpec.rise
+    dust.uniforms.uPointScale.value = torsoSpec.particleRadius * pixelRatio
+
+    // Re-apply the face uniforms every frame so the debug sliders can tune them live. `faceSubdiv`
+    // is structural (it sizes the geometry), so it still needs a reload.
+    ghost.uniforms.uGlow.value = faceSpec.facePointAlpha
+    ghost.uniforms.uPointScale.value = faceSpec.facePointSize * pixelRatio
+    ghost.uniforms.uJitter.value = faceSpec.faceJitter
+    ghost.uniforms.uColor.value.set(faceSpec.faceColor)
+
+    faceSurface.uniforms.uSoftness.value = faceSpec.faceDissolveSoftness
+    faceSurface.uniforms.uNoiseScale.value = faceSpec.faceNoiseScale
+    faceSurface.uniforms.uNoiseSpeed.value = faceSpec.faceNoiseSpeed
+    faceSurface.uniforms.uFadeStart.value = faceSpec.faceFadeStart
+    faceSurface.uniforms.uColor.value.set(faceSpec.faceColor)
 
     if (!root.visible) {
-      return { visible: false, opacity, contour: { visible: false, reason: 'persona-hidden' } }
+      return {
+        visible: false,
+        opacity,
+        contour: { visible: false, reason: 'persona-hidden' },
+        surface: { visible: false, reason: 'persona-hidden' },
+      }
     }
 
-    if (landmarks) updateTorso(landmarks, view, torso, body.uniforms, dust.uniforms)
-    const contourStatus = updateFaceContour(faceLandmarks, faceOval, view, contour, spec.faceDepth)
+    if (landmarks) updateTorso(landmarks, view, torso, dust.uniforms)
+    const surfaceStatus = updateFaceSurface(faceLandmarks, faceSurface, view, faceSpec.faceDepth)
+    const contourStatus = updateGhostFace(faceLandmarks, ghost, view, faceSpec.faceDepth)
+    updateHeadDust(contourStatus, headDust, faceSpec.faceDepth)
 
     debugCheckGeometry()
 
@@ -633,17 +1007,21 @@ export function createPersona({
       }
     }
 
-    return { visible: root.visible, opacity, contour: contourStatus }
+    return { visible: root.visible, opacity, contour: contourStatus, surface: surfaceStatus }
   }
 
   function dispose() {
-    body.mesh.geometry.dispose()
-    body.mesh.material.dispose()
     dust.points.geometry.dispose()
     dust.points.material.dispose()
-    contour.geometry.dispose()
-    contour.material.dispose()
+    headDust.points.geometry.dispose()
+    headDust.points.material.dispose()
+    faceSurface.geometry.dispose()
+    faceSurface.mesh.material.dispose()
+    ghost.geometry.dispose()
+    ghost.points.material.dispose()
   }
 
-  return { group: root, update, dispose }
+  // `face` / `torso` are the live, mutable specs: the debug sliders write straight into them and
+  // the next `update()` picks the values up.
+  return { group: root, face: faceSpec, torso: torsoSpec, update, dispose }
 }

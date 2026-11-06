@@ -139,28 +139,19 @@ export const EXTEND_HAND = {
 /**
  * PERSONA: the figure that materialises while the player is at the mirror.
  *
- * Two layers share one silhouette:
- *   - a coarse shoulder→hip mesh whose fragment shader burns its edges into animated noise,
- *     giving the smoky body;
- *   - a dust cloud of points seeded across the same volume, drifting on their own noise, so
- *     the body looks like it is unravelling into particles.
- * The FaceLandmarker's face-oval contour then sits just in front as a dim cool line.
+ * A dust cloud seeded across the shoulder→hip volume forms the wispy torso silhouette; the
+ * tesselated face surface and ghost-face contour points sit in front, with a dust halo around
+ * the head.
  *
  * The colours are deliberately low-luminance to replace the reflection
  */
 export const PERSONA = {
-  bodyColor: 0x2b3550,
   dustColor: 0x6f8fc4,
   faceColor: 0x9fd8ff,
 
   /** Peak alphas for each layer, before the materialise/dissolve ramp. */
-  bodyOpacity: 0.55,
-  dustOpacity: 0.5,
-  faceOpacity: 0.9,
-
-  /** Torso mesh subdivision. More cells = a smoother dissolve, at a vertex cost. */
-  columns: 24,
-  rows: 32,
+  dustOpacity: 0.9,
+  faceOpacity: 0.02,
 
   /** Dust cloud. */
   particleCount: 900,
@@ -169,23 +160,50 @@ export const PERSONA = {
   dustSpread: 1.22,
   /** Torso thickness and per-particle drift, in mirror-frame world units. */
   depth: 0.22,
-  drift: 0.06,
+  drift: 0.05,
   rise: 0.04,
 
-  /** Noise look: spatial frequency (x, y) for the fringe, and animation speed. */
-  noiseScale: [3.0, 6.0],
-  /** Fraction of the noise field burned away at full opacity. Higher = thinner smoke. */
-  dissolve: 0.18,
-  /** At zero opacity the smoke is almost all holes, so it coalesces as it appears. */
-  dissolveAtZero: 0.6,
-  dissolveSoftness: 0.35,
-  /** Vertex billow amplitude, in world units. */
-  displace: 0.05,
+  /**
+   * Head dust: a second cloud seeded in a ring around the face so the dust spreads around the
+   * head too. Positions are seeded at 0.55–1.0 of the face radius, then pushed out by `spread`.
+   */
+  headDustCount: 260,
+  headDustSpread: 1.5,
+  headDustSize: 5,
+  headDustOpacity: 0.5,
+  headDustDrift: 0.15,
+  headDustRise: 0.04,
+  headDustColor: 0x8fb4e0,
 
   /** Opacity ramp time constants (seconds) for appearing and dissolving. */
   appearTau: 0.5,
   disappearTau: 0.7,
 
-  /** How far in front of the torso the face contour sits. */
+  /**
+   * Ghost face: the face features (oval, lips, eyes, nose) are drawn as soft additive points
+   * sampled along each contour. `faceSubdiv` samples per segment, `facePointSize` is the sprite
+   * radius in px, `faceJitter` the per-point shimmer, `facePointAlpha` the per-point alpha
+   * (overlaps accumulate, so keep it low).
+   */
+  faceSubdiv: 3,
+  facePointSize: 5,
+  faceJitter: 0.008,
+  facePointAlpha: 0.6,
+
+  /**
+   * Face surface: the tesselated face mesh, dissolved by procedural noise so it vanishes piece
+   * by piece. `faceDissolve` is the burn threshold at full opacity, `faceDissolveAtZero` at
+   * zero opacity (higher = more holes while materialising/dissolving).
+   */
+  faceSurfaceOpacity: 0.650,
+  faceDissolve: 0.110,
+  faceDissolveAtZero: 1,
+  faceDissolveSoftness: 0.4,
+  faceNoiseScale: 2.75,
+  faceNoiseSpeed: 0.15,
+  /** Fraction of the face radius that stays solid before the edge fade begins (0–1). */
+  faceFadeStart: 0.5,
+
+  /** How far in front of the torso the face sits. */
   faceDepth: 0.06,
 }

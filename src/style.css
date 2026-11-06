@@ -81,3 +81,49 @@ body {
 .status-error {
   color: #ff6b6b;
 }
+
+/* Live tuning panels (debug aid). Stacked in a fixed column so they never overlap. */
+.debug-stack {
+  position: fixed;
+  top: 1rem;
+  right: 1rem;
+  z-index: 30;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  width: 280px;
+  max-height: calc(100vh - 2rem);
+  overflow: auto;
+}
+
+.debug-panel {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid rgba(125, 255, 176, 0.28);
+  border-radius: 6px;
+  background: rgba(0, 0, 0, 0.62);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #7dffb0;
+}
+
+.debug-panel summary {
+  cursor: pointer;
+  margin-bottom: 0.35rem;
+  font-weight: 600;
+}
+
+.debug-row {
+  display: grid;
+  grid-template-columns: 68px 1fr 44px;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.debug-row input[type='range'] {
+  width: 100%;
+  accent-color: #7dffb0;
+}
+
+.debug-row output {
+  text-align: right;
+  color: #cfd8ff;
+}

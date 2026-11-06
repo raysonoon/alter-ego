@@ -16,8 +16,8 @@ An interactive, automated "Magic Mirror" escape room prop
 The `vision/` layer is implemented (`camera.js`, `pose.js`, `gesture.js`, `face.js`, plus
 `fileset.js` for the shared WASM runtime) along with `config.js` and the `state.js` state
 machine. The `scene/` layer now renders the persona: `renderer.js` owns the black canvas and an
-orthographic camera, and `persona.js` draws the wispy shoulder→hip silhouette (noise-dissolved
-mesh + drifting dust) with the FaceLandmarker's face-oval contour in front. `main.js` boots the
+orthographic camera, and `persona.js` draws the wispy shoulder→hip dust silhouette plus a
+tesselated, noise-dissolved face surface and ghost-face contour points. `main.js` boots the
 models and drives the persona from the state machine. `audio/` is still to be written. Each
 concern — vision, state machine, scene, audio — lives in its own folder so the interaction
 loop can be traced from one file to the next.
@@ -47,7 +47,7 @@ alter-ego/
 │   │   └── stateHarness.js     # camera-free state-machine verification (scripted timelines)
 │   ├── scene/
 │   │   ├── renderer.js         # Three.js renderer, orthographic camera, resize
-│   │   ├── persona.js          # shoulder→hip dissolve mesh + dust cloud + face contour
+│   │   ├── persona.js          # shoulder→hip dust cloud + tesselated face surface + ghost face
 │   │   └── effects/
 │   │       └── glassBreak.js   # glass-break visual effect (not written yet)
 │   └── audio/
@@ -64,7 +64,8 @@ Notes:
   `audio/` will hang off. It is pure (no DOM, no MediaPipe, no Three.js), which is what lets
   `dev/stateHarness.js` verify it without a camera.
 - `scene/persona.js` maps normalised landmarks onto an orthographic frame (flipped horizontally
-  to line up with the mirror) and exists only outside IDLE: a shoulder→hip mesh is burned into
-  animated noise, a dust cloud drifts over it, and the `face.js` face-oval contour sits in
-  front. All colours, opacity, noise and ramp timings live in `PERSONA` in `config.js`.
+  to line up with the mirror) and exists only outside IDLE: a shoulder→hip dust cloud forms the
+  torso silhouette, a tesselated face surface dissolves with noise in front of it, and the
+  ghost-face contour points sit on top. All colours, opacity, noise and ramp timings live in
+  `PERSONA` in `config.js`.
 - Keep the page background pure black (`#000000`); no HTML chrome around the canvas.
