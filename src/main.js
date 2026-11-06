@@ -1,5 +1,5 @@
 import './style.css'
-import { APPROACH, DISTANCE, EXTEND_HAND } from './config.js'
+import { APPROACH, DISTANCE, EXTEND_HAND, GESTURE } from './config.js'
 import { createStateMachine } from './state.js'
 import { startCamera } from './vision/camera.js'
 import {
@@ -91,6 +91,26 @@ const TORSO_SLIDERS = [
 ]
 
 /**
+ * Live hand-dust sliders, writing straight into the persona's mutable `hand` spec. `handParticleCount`
+ * and the colour are structural / init-time values, so they're excluded.
+ */
+const HAND_SLIDERS = [
+  { key: 'handDustOpacity', label: 'dust opacity', min: 0, max: 1, step: 0.01 },
+  { key: 'handDustSpread', label: 'dust spread', min: 0.5, max: 3, step: 0.01 },
+  { key: 'handArmThickness', label: 'arm thickness', min: 0.02, max: 0.6, step: 0.01 },
+  { key: 'handArmElbowTaper', label: 'elbow taper', min: 0.05, max: 1, step: 0.01 },
+  { key: 'handArmTaper', label: 'arm taper', min: 0.05, max: 1, step: 0.01 },
+  { key: 'handCapOpacity', label: 'hand opacity', min: 0, max: 1, step: 0.01 },
+  { key: 'handCapSize', label: 'hand size', min: 1, max: 20, step: 0.5 },
+  { key: 'handCapSpread', label: 'hand spread', min: 0.5, max: 3, step: 0.01 },
+  { key: 'handDepth', label: 'depth', min: 0, max: 0.4, step: 0.01 },
+  { key: 'handDrift', label: 'drift', min: 0, max: 0.2, step: 0.005 },
+  { key: 'handRise', label: 'rise', min: 0, max: 0.1, step: 0.005 },
+  { key: 'handParticleRadius', label: 'dust size', min: 1, max: 20, step: 0.5 },
+  { key: 'handMinSpan', label: 'min span', min: 0, max: 0.5, step: 0.01 },
+]
+
+/**
  * Build a collapsible panel of sliders over a mutable spec. Each slider writes into `spec[key]`
  * by default, or through `get`/`set` for nested values (e.g. `noiseScale[0]`). The persona's
  * `update()` re-applies these uniforms every frame, so changes are live.
@@ -158,6 +178,10 @@ function createTorsoControls(persona) {
   getDebugStack().appendChild(createSliderPanel('torso', TORSO_SLIDERS, persona.torso))
 }
 
+function createHandControls(persona) {
+  getDebugStack().appendChild(createSliderPanel('hand', HAND_SLIDERS, persona.hand))
+}
+
 const machine = createStateMachine()
 
 // Scene first: the renderer owns the black canvas, and the persona is added before any model
@@ -169,11 +193,13 @@ const persona = createPersona({
   view: renderer.view,
   faceFeatures: FACE_FEATURES,
   faceTriangles: FACE_TRIANGLES,
+  handCount: GESTURE.numHands,
   pixelRatio: renderer.renderer.getPixelRatio(),
 })
 renderer.scene.add(persona.group)
 createFaceControls(persona)
 createTorsoControls(persona)
+createHandControls(persona)
 
 let camera
 let pose
@@ -252,7 +278,13 @@ function tick() {
     lastTransition = events.join(', ')
   }
 
-  const personaFrame = persona.update({ landmarks, faceLandmarks, state, dt })
+  const personaFrame = persona.update({
+    landmarks,
+    faceLandmarks,
+    handLandmarks: hand.landmarks,
+    state,
+    dt,
+  })
   renderer.render()
 
   const distanceLine = distance != null
@@ -284,6 +316,16 @@ function tick() {
       : `hidden (${surface.reason})`
     : '—'
 
+  const handsLine = personaFrame?.hands?.length
+    ? personaFrame.hands
+        .map((handStatus, i) =>
+          handStatus.visible
+            ? `#${i} ${handStatus.bent ? 'bent' : 'straight'} len ${(handStatus.length ?? 0).toFixed(2)} base ${(handStatus.shoulderThick ?? 0).toFixed(2)} elbow ${(handStatus.elbowThick ?? 0).toFixed(2)} tip ${(handStatus.handThick ?? 0).toFixed(2)} cap ${handStatus.cap ? 'on' : 'off'}`
+            : `#${i} ${handStatus.reason ?? 'hidden'}`,
+        )
+        .join('  ')
+    : '—'
+
   readout.textContent = [
     `state     ${state}  (${((timestamp - stateChangedAt) / 1000).toFixed(1)}s)`,
     `events    ${lastTransition}`,
@@ -296,6 +338,7 @@ function tick() {
     `persona   op ${(personaFrame?.opacity ?? 0).toFixed(2)}  ${personaFrame?.visible ? 'shown' : 'hidden'}  ${FACE_FEATURES.length} features`,
     `contour   ${contourLine}`,
     `surface   ${surfaceLine}`,
+    `handDust  ${handsLine}`,
     `hand      ${handLandmarks ? `spread ${spread.toFixed(3)} (${tips} tips) / needs ${EXTEND_HAND.minSpread}` : 'none'}`,
     `depth     ${handLandmarks ? `z-spread ${zSpread.toFixed(3)} / needs ${EXTEND_HAND.minZSpread}` : '—'}`,
     `fingers   ${fingerLine}${handLandmarks ? `  → pointing ${pointing}/4` : ''}`,

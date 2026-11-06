@@ -70,10 +70,55 @@ export const APPROACH = {
 }
 
 export const GESTURE = {
-  numHands: 1,
+  numHands: 2,
   minHandDetectionConfidence: 0.5,
   minHandPresenceConfidence: 0.5,
   minTrackingConfidence: 0.5,
+}
+
+/**
+ * HAND DUST: the dust cloud that clings to each tracked hand.
+ *
+ * It mirrors the torso cloud but is seeded across the hand's bounding box instead. 
+ * Values are in mirror-frame world units; the hand is small on a mirror-mounted camera, so its point
+ * size and spread are deliberately larger-relative than the torso's.
+ */
+export const HAND = {
+  /** Particles per hand. Two clouds are live whenever both hands are tracked. */
+  particleCount: 220,
+  /** Sprite radius in px, before the device pixel ratio. */
+  particleRadius: 4,
+  dustColor: 0x8fb4e0,
+  dustOpacity: 0.75,
+  /** Dust may spill past the hand's bounding box so the edge reads as unravelling. */
+  dustSpread: 1.35,
+  /**
+   * The dust runs continuously from the torso down the arm as two capsules — shoulder→elbow and
+   * elbow→hand — so a bent arm reads naturally. `armThickness` is the base (shoulder-end) radius
+   * as a fraction of shoulder width, `armElbowTaper` the elbow radius as a fraction of that base,
+   * and `armTaper` the hand-end radius as a fraction of the base.
+   */
+  armThickness: 0.22,
+  armElbowTaper: 0.75,
+  armTaper: 0.55,
+  /**
+   * A distinct hand cap sits over the hand at the end of the arm: denser, larger particles and a
+   * brighter colour so the hand reads as its own silhouette instead of just the tip of the arm.
+   */
+  capCount: 180,
+  capSize: 6,
+  capOpacity: 0.95,
+  capColor: 0xcfe8ff,
+  capSpread: 1.5,
+  /** Cloud thickness / z-offset in front of the torso. */
+  depth: 0.04,
+  drift: 0.015,
+  rise: 0.008,
+  /**
+   * Smallest hand bounding-box span (world units) we still draw. A cropped, partially-tracked
+   * hand would otherwise collapse to a point and flash a dot at the frame edge.
+   */
+  minSpan: 0.05,
 }
 
 /**

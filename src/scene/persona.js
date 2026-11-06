@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { PERSONA } from '../config.js'
+import { HAND, PERSONA } from '../config.js'
 import { POSE_LANDMARKS } from '../vision/pose.js'
 
 /** The debug geometry scan is scaffolding; keep it out of the production build. */
@@ -44,11 +44,36 @@ export const TORSO_DEFAULTS = {
 }
 
 /**
+ * Default tunables for the per-hand dust cloud. They mirror `HAND` so the current values stay
+ * the defaults, but they are also exposed as the overridable `hand` parameter of `createPersona`.
+ */
+export const HAND_DEFAULTS = {
+  handParticleCount: HAND.particleCount,
+  handParticleRadius: HAND.particleRadius,
+  handDustColor: HAND.dustColor,
+  handDustOpacity: HAND.dustOpacity,
+  handDustSpread: HAND.dustSpread,
+  handArmThickness: HAND.armThickness,
+  handArmElbowTaper: HAND.armElbowTaper,
+  handArmTaper: HAND.armTaper,
+  handCapCount: HAND.capCount,
+  handCapSize: HAND.capSize,
+  handCapOpacity: HAND.capOpacity,
+  handCapColor: HAND.capColor,
+  handCapSpread: HAND.capSpread,
+  handDepth: HAND.depth,
+  handDrift: HAND.drift,
+  handRise: HAND.rise,
+  handMinSpan: HAND.minSpan,
+}
+
+/**
  * The persona: a wispy, dusty silhouette that mirrors the player.
  *
  * Layers share the frame and one opacity ramp:
  *   - `dust`   — points seeded across the shoulder→hip volume, drifting on their own noise so the
  *                torso reads as a wispy, dusty silhouette;
+ *   - `hand`   — one small dust cloud per tracked hand, seeded across that hand's bounding box;
  *   - `face`   — the tesselated face surface plus the ghost-face contour points, with a dust halo
  *                around the head.
  *
@@ -175,6 +200,92 @@ const DUST_FRAGMENT = /* glsl */ `
     float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uOpacity;
     if (alpha < 0.003) discard;
     gl_FragColor = vec4(uColor, alpha);
+  }
+`
+
+/**
+ * Arm dust: a particle cloud seeded in a unit box that the shader stretches into a straight
+ * tapered capsule from the shoulder (local x = -0.5) to the hand (local x = +0.5). The radius
+ * tapers from `uShoulderThick` to `uHandThick`, so the same dust that forms the torso also runs
+ * continuously down the arm and gathers on the hand.
+ */
+const HAND_ARM_VERTEX = /* glsl */ `
+  attribute float aSeed;
+  attribute float aSize;
+
+  uniform float uTime;
+  uniform float uLength;
+  uniform float uShoulderThick;
+  uniform float uHandThick;
+  uniform float uDepth;
+  uniform float uSpread;
+  uniform float uDrift;
+  uniform float uRise;
+  uniform float uPointScale;
+  uniform float uOpacity;
+
+  ${NOISE3D_GLSL}
+
+  void main() {
+    // position.x runs -0.5 (shoulder) → +0.5 (hand); position.yz is the round cross-section.
+    float t = position.x + 0.5;
+    float radius = mix(uShoulderThick, uHandThick, t) * uSpread;
+
+    vec3 p;
+    p.x = position.x * uLength;
+    p.y = position.y * radius;
+    p.z = position.z * radius * uDepth;
+
+    // Independent drift per particle; time is the third axis so neighbours flow together.
+    float n1 = valueNoise3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
+    float n2 = valueNoise3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
+    p.x += (n1 - 0.5) * uDrift;
+    p.y += (n2 - 0.5) * uDrift;
+    p.z += (n1 - 0.5) * uDepth;
+    p.y += sin(uTime * 0.6 + aSeed * 6.2831) * uRise;
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
+  }
+`
+
+/**
+ * Hand cap: a small, dense cloud seeded over the hand's bounding box. It sits at the end of the
+ * arm capsule, brighter and denser than the arm, so the hand reads as a distinct silhouette
+ * rather than just the tapered tip of the arm.
+ */
+const HAND_CAP_VERTEX = /* glsl */ `
+  attribute float aSeed;
+  attribute float aSize;
+
+  uniform float uTime;
+  uniform float uWidth;
+  uniform float uHeight;
+  uniform float uDepth;
+  uniform float uSpread;
+  uniform float uDrift;
+  uniform float uRise;
+  uniform float uPointScale;
+  uniform float uOpacity;
+
+  ${NOISE3D_GLSL}
+
+  void main() {
+    vec3 p;
+    p.x = position.x * uWidth * uSpread;
+    p.y = position.y * uHeight * uSpread;
+    p.z = position.z * uDepth;
+
+    // Independent drift per particle; time is the third axis so neighbours flow together.
+    float n1 = valueNoise3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
+    float n2 = valueNoise3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
+    p.x += (n1 - 0.5) * uDrift;
+    p.y += (n2 - 0.5) * uDrift;
+    p.z += (n1 - 0.5) * uDepth;
+    p.y += sin(uTime * 0.6 + aSeed * 6.2831) * uRise;
+
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
   }
 `
 
@@ -363,6 +474,112 @@ function createDust(spec, pixelRatio) {
   points.name = 'dust'
   points.frustumCulled = false
   points.renderOrder = 1
+
+  return { points, uniforms }
+}
+
+function createHandArm(spec, pixelRatio) {
+  const count = spec.handParticleCount
+  const positions = new Float32Array(count * 3)
+  const seeds = new Float32Array(count)
+  const sizes = new Float32Array(count)
+
+  for (let i = 0; i < count; i += 1) {
+    // Seed a unit box; the shader stretches it into the shoulder→hand arm capsule each frame.
+    positions[i * 3] = Math.random() - 0.5
+    positions[i * 3 + 1] = Math.random() - 0.5
+    positions[i * 3 + 2] = Math.random() - 0.5
+    seeds[i] = Math.random()
+    sizes[i] = 0.4 + Math.random() * 0.9
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uColor: { value: new THREE.Color(spec.handDustColor) },
+    uOpacity: { value: 0 },
+    uLength: { value: 0.3 },
+    uShoulderThick: { value: 0.1 },
+    uHandThick: { value: 0.05 },
+    uDepth: { value: spec.handDepth },
+    uSpread: { value: spec.handDustSpread },
+    uDrift: { value: spec.handDrift },
+    uRise: { value: spec.handRise },
+    uPointScale: { value: spec.handParticleRadius * pixelRatio },
+  }
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: HAND_ARM_VERTEX,
+    fragmentShader: DUST_FRAGMENT,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  })
+
+  const points = new THREE.Points(geometry, material)
+  points.name = 'handArm'
+  points.frustumCulled = false
+  points.renderOrder = 1
+  points.visible = false
+
+  return { points, uniforms }
+}
+
+function createHandCap(spec, pixelRatio) {
+  const count = spec.handCapCount
+  const positions = new Float32Array(count * 3)
+  const seeds = new Float32Array(count)
+  const sizes = new Float32Array(count)
+
+  for (let i = 0; i < count; i += 1) {
+    // Seed a unit box; the shader scales it to the hand's bounding box each frame.
+    positions[i * 3] = Math.random() - 0.5
+    positions[i * 3 + 1] = Math.random() - 0.5
+    positions[i * 3 + 2] = Math.random() - 0.5
+    seeds[i] = Math.random()
+    // Larger sprites than the arm so the hand reads denser and more prominent.
+    sizes[i] = 0.7 + Math.random() * 1.1
+  }
+
+  const geometry = new THREE.BufferGeometry()
+  geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
+  geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1))
+  geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+
+  const uniforms = {
+    uTime: { value: 0 },
+    uColor: { value: new THREE.Color(spec.handCapColor) },
+    uOpacity: { value: 0 },
+    uWidth: { value: 0.2 },
+    uHeight: { value: 0.2 },
+    uDepth: { value: spec.handDepth },
+    uSpread: { value: spec.handCapSpread },
+    uDrift: { value: spec.handDrift },
+    uRise: { value: spec.handRise },
+    uPointScale: { value: spec.handCapSize * pixelRatio },
+  }
+
+  const material = new THREE.ShaderMaterial({
+    uniforms,
+    vertexShader: HAND_CAP_VERTEX,
+    fragmentShader: DUST_FRAGMENT,
+    transparent: true,
+    depthTest: false,
+    depthWrite: false,
+    blending: THREE.AdditiveBlending,
+  })
+
+  const points = new THREE.Points(geometry, material)
+  points.name = 'handCap'
+  points.frustumCulled = false
+  points.renderOrder = 2 // above the arm, so the hand reads as the front layer
+  points.visible = false
 
   return { points, uniforms }
 }
@@ -804,6 +1021,211 @@ function updateHeadDust(faceStatus, headDust, depth) {
   headDust.points.visible = true
 }
 
+/** World-space bounding box of a hand's 21 landmarks, or null when it cannot be measured. */
+function handBounds(handLandmarks, view) {
+  const halfWidth = view?.halfWidth
+  const halfHeight = view?.halfHeight
+  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return null
+
+  const fullWidth = halfWidth * 2
+  const fullHeight = halfHeight * 2
+
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  let written = 0
+
+  for (const landmark of handLandmarks) {
+    if (!landmark) continue
+    const { x, y } = landmark
+    if (!Number.isFinite(x) || !Number.isFinite(y)) continue
+
+    const worldX = (0.5 - x) * fullWidth
+    const worldY = (0.5 - y) * fullHeight
+    minX = Math.min(minX, worldX)
+    maxX = Math.max(maxX, worldX)
+    minY = Math.min(minY, worldY)
+    maxY = Math.max(maxY, worldY)
+    written += 1
+  }
+
+  if (written < 2) return null
+
+  return {
+    x: (minX + maxX) / 2,
+    y: (minY + maxY) / 2,
+    width: maxX - minX,
+    height: maxY - minY,
+    radius: Math.max(maxX - minX, maxY - minY) / 2,
+    written,
+  }
+}
+
+/**
+ * Point one dust capsule from `from` to `to`, tapering its radius from `fromThick` to `toThick`.
+ *
+ * The cloud is a unit box stretched along its local x-axis and rotated to the segment vector, so
+ * local -x lands on `from` and local +x lands on `to`. Two of these — shoulder→elbow and
+ * elbow→hand — make one continuous arm that bends at the elbow.
+ */
+function updateArmSegment(from, to, fromThick, toThick, arm, spec) {
+  const points = arm.points
+  const dx = to.x - from.x
+  const dy = to.y - from.y
+  const length = Math.hypot(dx, dy)
+
+  if (length < 1e-4 || fromThick < 1e-4) {
+    points.visible = false
+    return { visible: false, length: 0 }
+  }
+
+  points.position.set((from.x + to.x) / 2, (from.y + to.y) / 2, spec.handDepth)
+  points.rotation.z = Math.atan2(dy, dx)
+
+  arm.uniforms.uLength.value = length
+  arm.uniforms.uShoulderThick.value = fromThick
+  arm.uniforms.uHandThick.value = toThick
+  points.visible = true
+
+  return { visible: true, length }
+}
+
+/** Position the bright hand cap over the hand's bounding box at the end of the arm. */
+function updateHandCap(handBox, handCap, spec) {
+  const points = handCap.points
+
+  if (handBox.width < 1e-4 && handBox.height < 1e-4) {
+    points.visible = false
+    return false
+  }
+
+  points.position.set(handBox.x, handBox.y, spec.handDepth)
+  handCap.uniforms.uWidth.value = handBox.width
+  handCap.uniforms.uHeight.value = handBox.height
+  points.visible = true
+  return true
+}
+
+/**
+ * Drive every hand's arm and hand cap, attaching each tracked hand to its nearest pose shoulder.
+ *
+ * Each arm is two capsules — shoulder→elbow and elbow→hand — so it bends naturally at the elbow;
+ * when the elbow is missing it falls back to a single straight shoulder→hand capsule.
+ *
+ * Two hands can both be tracked, so shoulders are claimed greedily: once an arm has taken a
+ * shoulder the other hand picks the remaining one, which keeps the two arms from collapsing
+ * onto the same side of the body.
+ */
+function updateHands(landmarks, handLandmarks, handUnits, view, spec) {
+  const statuses = handUnits.map(() => ({ visible: false, reason: 'no-hand', cap: false }))
+  if (!handUnits.length) return statuses
+
+  for (const unit of handUnits) {
+    for (const arm of unit.arms) arm.points.visible = false
+    unit.cap.points.visible = false
+  }
+
+  const left = toWorld(landmarks?.[POSE_LANDMARKS.LEFT_SHOULDER], view)
+  const right = toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_SHOULDER], view)
+  if (!left || !right) {
+    return statuses.map(() => ({ visible: false, reason: 'no-shoulders', cap: false }))
+  }
+
+  const shoulders = [left, right]
+  const elbows = [
+    toWorld(landmarks?.[POSE_LANDMARKS.LEFT_ELBOW], view),
+    toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_ELBOW], view),
+  ]
+  const shoulderWidth = distance(left, right)
+  const claimed = new Set()
+
+  for (let i = 0; i < handUnits.length; i += 1) {
+    const unit = handUnits[i]
+    const hand = handLandmarks?.[i]
+    if (!hand) continue
+
+    const box = handBounds(hand, view)
+    if (!box) {
+      statuses[i] = { visible: false, reason: 'no-hand-bounds', cap: false }
+      continue
+    }
+
+    // Nearest unclaimed shoulder; fall back to the nearest overall if both are already taken.
+    let best = -1
+    let bestDist = Infinity
+    for (let s = 0; s < shoulders.length; s += 1) {
+      if (claimed.has(s)) continue
+      const d = Math.hypot(box.x - shoulders[s].x, box.y - shoulders[s].y)
+      if (d < bestDist) {
+        bestDist = d
+        best = s
+      }
+    }
+    if (best < 0) {
+      for (let s = 0; s < shoulders.length; s += 1) {
+        const d = Math.hypot(box.x - shoulders[s].x, box.y - shoulders[s].y)
+        if (d < bestDist) {
+          bestDist = d
+          best = s
+        }
+      }
+    }
+    if (best < 0) {
+      statuses[i] = { visible: false, reason: 'no-shoulder', cap: false }
+      continue
+    }
+
+    claimed.add(best)
+
+    const shoulder = shoulders[best]
+    const elbow = elbows[best]
+    const handPoint = { x: box.x, y: box.y }
+
+    const shoulderThick = shoulderWidth * spec.handArmThickness
+    const elbowThick = shoulderThick * spec.handArmElbowTaper
+    const handThick = shoulderThick * spec.handArmTaper
+
+    // Bend only when the elbow is tracked and its two segments are a plausible arm. A missing or
+    // wildly misplaced elbow (cropped, or behind the shoulder) falls back to one straight capsule.
+    const armSpan = Math.hypot(handPoint.x - shoulder.x, handPoint.y - shoulder.y)
+    let useElbow = false
+    if (elbow && armSpan > spec.handMinSpan) {
+      const upper = Math.hypot(elbow.x - shoulder.x, elbow.y - shoulder.y)
+      const fore = Math.hypot(handPoint.x - elbow.x, handPoint.y - elbow.y)
+      useElbow = upper > 1e-3 && fore > 1e-3 && upper + fore < armSpan * 2.5
+    }
+
+    let upperVisible = false
+    let foreVisible = false
+    let totalLength = 0
+    if (useElbow) {
+      const up = updateArmSegment(shoulder, elbow, shoulderThick, elbowThick, unit.arms[0], spec)
+      const fore = updateArmSegment(elbow, handPoint, elbowThick, handThick, unit.arms[1], spec)
+      upperVisible = up.visible
+      foreVisible = fore.visible
+      totalLength = up.length + fore.length
+    } else {
+      const up = updateArmSegment(shoulder, handPoint, shoulderThick, handThick, unit.arms[0], spec)
+      upperVisible = up.visible
+      totalLength = up.length
+    }
+
+    const capVisible = updateHandCap(box, unit.cap, spec)
+    statuses[i] = {
+      visible: upperVisible || foreVisible || capVisible,
+      bent: useElbow,
+      length: totalLength,
+      shoulderThick,
+      elbowThick,
+      handThick,
+      cap: capVisible,
+    }
+  }
+
+  return statuses
+}
+
 /**
  * DEV-only guard: the renderer computes each geometry's bounding sphere for depth sorting, so a
  * single non-finite position produces the vague "Computed radius is NaN" warning. Walk the
@@ -832,6 +1254,8 @@ function findNonFiniteVertex(geometry) {
  * @param {typeof PERSONA} [options.spec]
  * @param {Partial<typeof FACE_DEFAULTS>} [options.face] per-call face-layer overrides
  * @param {Partial<typeof TORSO_DEFAULTS>} [options.torso] per-call torso-layer overrides
+ * @param {Partial<typeof HAND_DEFAULTS>} [options.hand] per-call hand-dust overrides
+ * @param {number} [options.handCount] number of hand-dust clouds to preallocate (one per hand)
  * @param {number} [options.pixelRatio] device pixel ratio for point sizing
  */
 export function createPersona({
@@ -841,12 +1265,15 @@ export function createPersona({
   spec = PERSONA,
   face = {},
   torso: torsoOverrides = {},
+  hand: handOverrides = {},
+  handCount = 2,
   pixelRatio = Math.min(globalThis.devicePixelRatio || 1, 2),
 }) {
-  // Face/torso layers read from a merged spec so any value can be overridden at the call site,
-  // while everything not passed falls back to the current config values.
+  // Face/torso/hand layers read from a merged spec so any value can be overridden at the call
+  // site, while everything not passed falls back to the current config values.
   const faceSpec = { ...FACE_DEFAULTS, ...face }
   const torsoSpec = { ...TORSO_DEFAULTS, ...torsoOverrides }
+  const handSpec = { ...HAND_DEFAULTS, ...handOverrides }
   // Guard against passing the renderer API instead of its `view` metrics (a silent mismatch:
   // halfWidth/halfHeight read as undefined and nothing maps).
   if (!Number.isFinite(view?.halfWidth) || !Number.isFinite(view?.halfHeight)) {
@@ -875,9 +1302,33 @@ export function createPersona({
   const headDust = createHeadDust(spec, pixelRatio)
   root.add(headDust.points)
 
+  // Two arm capsules (upper, forearm) plus one bright hand cap per hand, preallocated so a hand
+  // entering/leaving the frame just toggles visibility instead of reallocating geometry.
+  const handUnits = []
+  for (let i = 0; i < handCount; i += 1) {
+    const upper = createHandArm(handSpec, pixelRatio)
+    upper.points.name = `handArmUpper${i}`
+    root.add(upper.points)
+
+    const fore = createHandArm(handSpec, pixelRatio)
+    fore.points.name = `handArmFore${i}`
+    root.add(fore.points)
+
+    const cap = createHandCap(handSpec, pixelRatio)
+    cap.points.name = `handCap${i}`
+    root.add(cap.points)
+
+    handUnits.push({ arms: [upper, fore], cap })
+  }
+
   const layers = [
     { name: 'dust', object: dust.points },
     { name: 'headDust', object: headDust.points },
+    ...handUnits.flatMap(({ arms, cap }, i) => [
+      { name: `handArmUpper${i}`, object: arms[0].points },
+      { name: `handArmFore${i}`, object: arms[1].points },
+      { name: `handCap${i}`, object: cap.points },
+    ]),
     { name: 'faceSurface', object: faceSurface.mesh },
     { name: 'face', object: ghost.points },
   ]
@@ -911,10 +1362,11 @@ export function createPersona({
    * @param {object} frame
    * @param {Array<{x:number,y:number,z:number}>} [frame.landmarks] pose landmarks (normalised)
    * @param {Array<{x:number,y:number,z:number}>} [frame.faceLandmarks] face-mesh landmarks
+   * @param {Array<Array<{x:number,y:number,z:number}>>} [frame.handLandmarks] per-hand landmark sets
    * @param {string} frame.state current IDLE / APPROACH / EXIT state
    * @param {number} [frame.dt] seconds since the previous frame
    */
-  function update({ landmarks, faceLandmarks, state, dt = 0 } = {}) {
+  function update({ landmarks, faceLandmarks, handLandmarks, state, dt = 0 } = {}) {
     const step = Math.min(Math.max(dt, 0), 0.25)
     time += step
 
@@ -937,6 +1389,15 @@ export function createPersona({
     faceSurface.uniforms.uOpacity.value = opacity * faceSpec.faceSurfaceOpacity
     ghost.uniforms.uOpacity.value = opacity * faceSpec.faceOpacity
 
+    for (const { arms, cap } of handUnits) {
+      for (const arm of arms) {
+        arm.uniforms.uTime.value = time
+        arm.uniforms.uOpacity.value = opacity * handSpec.handDustOpacity
+      }
+      cap.uniforms.uTime.value = time
+      cap.uniforms.uOpacity.value = opacity * handSpec.handCapOpacity
+    }
+
     // The surface coalesces as it appears and burns away piece by piece as it leaves.
     faceSurface.uniforms.uDissolve.value = THREE.MathUtils.lerp(
       faceSpec.faceDissolveAtZero,
@@ -951,6 +1412,26 @@ export function createPersona({
     dust.uniforms.uDrift.value = torsoSpec.drift
     dust.uniforms.uRise.value = torsoSpec.rise
     dust.uniforms.uPointScale.value = torsoSpec.particleRadius * pixelRatio
+
+    // Re-apply the hand uniforms every frame so the debug sliders can tune them live. Counts and
+    // colours are structural / init-time values.
+    for (const { arms, cap } of handUnits) {
+      for (const arm of arms) {
+        arm.uniforms.uColor.value.set(handSpec.handDustColor)
+        arm.uniforms.uSpread.value = handSpec.handDustSpread
+        arm.uniforms.uDepth.value = handSpec.handDepth
+        arm.uniforms.uDrift.value = handSpec.handDrift
+        arm.uniforms.uRise.value = handSpec.handRise
+        arm.uniforms.uPointScale.value = handSpec.handParticleRadius * pixelRatio
+      }
+
+      cap.uniforms.uColor.value.set(handSpec.handCapColor)
+      cap.uniforms.uSpread.value = handSpec.handCapSpread
+      cap.uniforms.uDepth.value = handSpec.handDepth
+      cap.uniforms.uDrift.value = handSpec.handDrift
+      cap.uniforms.uRise.value = handSpec.handRise
+      cap.uniforms.uPointScale.value = handSpec.handCapSize * pixelRatio
+    }
 
     // Re-apply the face uniforms every frame so the debug sliders can tune them live. `faceSubdiv`
     // is structural (it sizes the geometry), so it still needs a reload.
@@ -971,6 +1452,7 @@ export function createPersona({
         opacity,
         contour: { visible: false, reason: 'persona-hidden' },
         surface: { visible: false, reason: 'persona-hidden' },
+        hands: handUnits.map(() => ({ visible: false, reason: 'persona-hidden', cap: false })),
       }
     }
 
@@ -978,6 +1460,7 @@ export function createPersona({
     const surfaceStatus = updateFaceSurface(faceLandmarks, faceSurface, view, faceSpec.faceDepth)
     const contourStatus = updateGhostFace(faceLandmarks, ghost, view, faceSpec.faceDepth)
     updateHeadDust(contourStatus, headDust, faceSpec.faceDepth)
+    const hands = updateHands(landmarks, handLandmarks, handUnits, view, handSpec)
 
     debugCheckGeometry()
 
@@ -1007,7 +1490,13 @@ export function createPersona({
       }
     }
 
-    return { visible: root.visible, opacity, contour: contourStatus, surface: surfaceStatus }
+    return {
+      visible: root.visible,
+      opacity,
+      contour: contourStatus,
+      surface: surfaceStatus,
+      hands,
+    }
   }
 
   function dispose() {
@@ -1015,13 +1504,21 @@ export function createPersona({
     dust.points.material.dispose()
     headDust.points.geometry.dispose()
     headDust.points.material.dispose()
+    for (const { arms, cap } of handUnits) {
+      for (const arm of arms) {
+        arm.points.geometry.dispose()
+        arm.points.material.dispose()
+      }
+      cap.points.geometry.dispose()
+      cap.points.material.dispose()
+    }
     faceSurface.geometry.dispose()
     faceSurface.mesh.material.dispose()
     ghost.geometry.dispose()
     ghost.points.material.dispose()
   }
 
-  // `face` / `torso` are the live, mutable specs: the debug sliders write straight into them and
-  // the next `update()` picks the values up.
-  return { group: root, face: faceSpec, torso: torsoSpec, update, dispose }
+  // `face` / `torso` / `hand` are the live, mutable specs: the debug sliders write straight into
+  // them and the next `update()` picks the values up.
+  return { group: root, face: faceSpec, torso: torsoSpec, hand: handSpec, update, dispose }
 }
