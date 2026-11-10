@@ -82,6 +82,25 @@ body {
   color: #ff6b6b;
 }
 
+/* One-time LED connect button. Shown only until the serial port is open, then hidden. */
+.led-connect {
+  position: fixed;
+  left: 1rem;
+  bottom: 3rem;
+  z-index: 20;
+  padding: 0.35rem 0.7rem;
+  font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  color: #7dffb0;
+  background: rgba(0, 0, 0, 0.62);
+  border: 1px solid rgba(125, 255, 176, 0.4);
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.led-connect[hidden] {
+  display: none;
+}
+
 /* Live tuning panels (debug aid). Stacked in a fixed column so they never overlap. */
 .debug-stack {
   position: fixed;

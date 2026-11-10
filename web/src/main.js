@@ -18,6 +18,7 @@ import {
 import { createFaceLandmarker, FACE_REGIONS, FACE_TRIANGLES } from './vision/face.js'
 import { createRenderer } from './scene/renderer.js'
 import { createPersona } from './scene/persona.js'
+import { createLedLink } from './firmware.js'
 
 const app = document.querySelector('#app')
 
@@ -178,6 +179,11 @@ function createHandControls(persona) {
 
 const machine = createStateMachine()
 
+// Optional LED link to the Arduino. It reads the live state on (re)connect so the strip syncs
+// immediately, and `sendState` is only fired on transitions below. Unavailable browsers/boards
+// degrade to a no-op, so the mirror itself is never blocked by the lights.
+const ledLink = createLedLink({ container: app, getState: () => machine.state })
+
 // Scene first: the renderer owns the black canvas, and the persona is added before any model
 // loads so the mirror is already black (not an empty page) while booting.
 const renderer = createRenderer({ container: app })
@@ -270,6 +276,7 @@ function tick() {
   if (state !== previousState) {
     stateChangedAt = timestamp
     lastTransition = events.join(', ')
+    ledLink.sendState(state)
   }
 
   const personaFrame = persona.update({
@@ -334,6 +341,9 @@ function tick() {
 
 async function boot() {
   showStatus('starting…')
+  // Reconnect the LED link in parallel with the camera: it only needs a previously-granted
+  // port, and it must not hold up the mirror booting.
+  ledLink.autoConnect()
   camera = await startCamera()
 
   showStatus('loading models…')
@@ -374,5 +384,6 @@ if (import.meta.hot) {
     camera?.stop()
     persona.dispose()
     renderer.dispose()
+    ledLink.dispose()
   })
 }

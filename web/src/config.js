@@ -25,6 +25,22 @@ export const CAMERA = {
   preview: true,
 }
 
+/**
+ * LED LINK: the state push to the Arduino UNO R4 WiFi driving the addressable strip.
+ *
+ * The browser (Web Serial, Chromium only) sends one byte per state transition over the
+ * Arduino's native USB port. `commands` maps each state to that byte; the firmware turns it
+ * into a solid strip colour (IDLE red / APPROACH blue / EXIT green).
+ */
+export const SERIAL = {
+  baudRate: 9600,
+  commands: {
+    IDLE: 'I',
+    APPROACH: 'A',
+    EXIT: 'E',
+  },
+}
+
 export const POSE = {
   numPoses: 1,
   minPoseDetectionConfidence: 0.5,
