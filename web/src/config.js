@@ -63,7 +63,7 @@ export const DISTANCE = {
    * the lens field of view, not on the player, so it is calibrated once — stand at a known
    * distance, read the reported value, and scale this until it matches.
    */
-  focalFactor: 0.87,
+  focalFactor: 0.55,
   /**
    * Narrowest apparent shoulder width we still trust. Below this the pose is edge-on or too
    * far away and the ratio would blow up, so the frame reports "no reading".
@@ -281,15 +281,19 @@ export const PERSONA = {
   /**
    * Figure scale: a uniform multiplier on the whole persona (torso, face, hands and halo) and on
    * the dust point sizes. 1 sizes the figure to the frame; <1 shrinks it, >1 grows it.
+   *
+   * Currently set for the landscape monitor (1). A portrait panel needed ~2.5 with 'contain'.
    */
-  scale: 2.5,
+  scale: 1.4,
 
   /**
    * How the normalised camera frame maps onto the mirror frame:
+   *   - 'fill' maps x/y straight onto the frame (stretches to fit) — the landscape behaviour;
    *   - 'contain' keeps the camera's aspect, so the figure is never stretched; it fits inside
-   *     the frame and is letterboxed on the long axis. The right choice for a portrait monitor
-   *     driven by a landscape webcam;
-   *   - 'fill' maps x/y straight onto the frame (stretches to fit) — the historical behaviour.
+   *     the frame and is letterboxed on the long axis. Required for a portrait monitor.
+   *
+   * Currently the landscape monitor, so 'fill'. Switch to 'contain' (and raise `scale`) when a
+   * portrait panel is back.
    */
-  aspectFit: 'contain',
+  aspectFit: 'fill',
 }
