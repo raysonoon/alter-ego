@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { HAND, PERSONA } from '../config.js'
+import { CAMERA, HAND, PERSONA } from '../config.js'
 import { POSE_LANDMARKS } from '../vision/pose.js'
 
 /** The debug geometry scan is scaffolding; keep it out of the production build. */
@@ -32,6 +32,7 @@ export const TORSO_DEFAULTS = {
   dustColor: PERSONA.dustColor,
   dustOpacity: PERSONA.dustOpacity,
   dustSpread: PERSONA.dustSpread,
+  waistPinch: PERSONA.waistPinch,
   depth: PERSONA.depth,
   drift: PERSONA.drift,
   rise: PERSONA.rise,
@@ -58,7 +59,32 @@ export const HAND_DEFAULTS = {
   handDepth: HAND.depth,
   handDrift: HAND.drift,
   handRise: HAND.rise,
+  handEdgeSoftness: HAND.edgeSoftness,
+  handRagged: HAND.ragged,
+  handClump: HAND.clump,
+  handFlicker: HAND.flicker,
+  handFlickerSpeed: HAND.flickerSpeed,
+  handStream: HAND.stream,
   handMinSpan: HAND.minSpan,
+}
+
+/**
+ * Default tunables for the head-dust halo. They mirror `PERSONA`, but are also exposed as the
+ * overridable `head` parameter of `createPersona` — pass e.g. `head: { headDustSpread: 2 }` at
+ * the call site. `headDustCount` is structural and `headDustColor` init-time only.
+ */
+export const HEAD_DUST_DEFAULTS = {
+  headDustCount: PERSONA.headDustCount,
+  headDustSpread: PERSONA.headDustSpread,
+  headDustSize: PERSONA.headDustSize,
+  headDustOpacity: PERSONA.headDustOpacity,
+  headDustDrift: PERSONA.headDustDrift,
+  headDustRise: PERSONA.headDustRise,
+  headDustColor: PERSONA.headDustColor,
+  headDustTail: PERSONA.headDustTail,
+  headDustTailWidth: PERSONA.headDustTailWidth,
+  /** Cloud thickness in front of the face, shared with the torso depth. */
+  depth: PERSONA.depth,
 }
 
 /**
@@ -70,7 +96,8 @@ export const HAND_DEFAULTS = {
  *   - `hand`   — one small dust cloud per tracked hand, seeded across that hand's bounding box;
  *   - `face`   — a filled, drifting point cloud across the whole face, with the eyes, nose and
  *                mouth carved out as empty space.
- *   - `headDust` — a halo of dust around the face.
+ *   - `headDust` — a halo of dust around the face, with a downward plume that trails toward the
+ *                shoulders so the head reads as connected to the body.
  *
  * Only normalised landmark coordinates are used for geometry: they are what the mirror shows,
  * so mapping them straight onto the orthographic frame keeps the figure aligned with the
@@ -124,6 +151,7 @@ const DUST_VERTEX = /* glsl */ `
   uniform float uHipWidth;
   uniform float uTorsoHeight;
   uniform float uSpread;
+  uniform float uWaist;
   uniform float uDepth;
   uniform float uDrift;
   uniform float uRise;
@@ -134,7 +162,10 @@ const DUST_VERTEX = /* glsl */ `
 
   void main() {
     float t = position.y + 0.5;
-    float width = mix(uHipWidth, uShoulderWidth, t) * uSpread;
+    float base = mix(uHipWidth, uShoulderWidth, t);
+    // Gentle waist pinch around the chest so the silhouette curves instead of tapering straight.
+    float waist = 1.0 - uWaist * exp(-pow((t - 0.55) / 0.28, 2.0));
+    float width = base * waist * uSpread;
 
     vec3 p;
     p.x = position.x * width;
@@ -168,6 +199,25 @@ const DUST_FRAGMENT = /* glsl */ `
 `
 
 /**
+ * Wisp fragment: the same soft round sprite as `DUST_FRAGMENT`, but faded by a per-particle
+ * `vDensity` supplied by the vertex shader. That is what lets the hand dust break into strands,
+ * feather at its edge and twinkle, rather than reading as a filled, rigid shape.
+ */
+const WISP_FRAGMENT = /* glsl */ `
+  uniform vec3 uColor;
+  uniform float uOpacity;
+
+  varying float vDensity;
+
+  void main() {
+    float d = length(gl_PointCoord - 0.5);
+    float alpha = (1.0 - smoothstep(0.0, 0.5, d)) * uOpacity * vDensity;
+    if (alpha < 0.003) discard;
+    gl_FragColor = vec4(uColor, alpha);
+  }
+`
+
+/**
  * Arm dust: a particle cloud seeded in a unit box that the shader stretches into a straight
  * tapered capsule from the shoulder (local x = -0.5) to the hand (local x = +0.5). The radius
  * tapers from `uShoulderThick` to `uHandThick`, so the same dust that forms the torso also runs
@@ -185,8 +235,16 @@ const HAND_ARM_VERTEX = /* glsl */ `
   uniform float uSpread;
   uniform float uDrift;
   uniform float uRise;
+  uniform float uEdge;
+  uniform float uRagged;
+  uniform float uClump;
+  uniform float uFlicker;
+  uniform float uFlickerSpeed;
+  uniform float uStream;
   uniform float uPointScale;
   uniform float uOpacity;
+
+  varying float vDensity;
 
   ${NOISE3D_GLSL}
 
@@ -200,16 +258,31 @@ const HAND_ARM_VERTEX = /* glsl */ `
     p.y = position.y * radius;
     p.z = position.z * radius * uDepth;
 
-    // Independent drift per particle; time is the third axis so neighbours flow together.
-    float n1 = valueNoise3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
-    float n2 = valueNoise3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
+    // Soft cross-section: feather density toward the capsule wall so the arm's edge frays into
+    // wisps instead of ending at a hard cylinder. position.yz is the unit cross-section.
+    float r = length(position.yz * 2.0);
+    r += (valueNoise3(position * 3.0) - 0.5) * uRagged;
+    // uEdge is the feather width: small keeps a crisp edge, large fades from the centre out.
+    float feather = clamp(uEdge, 0.02, 1.0);
+    float edge = 1.0 - smoothstep(1.0 - feather, 1.0, r);
+
+    // Break the uniform fill into longitudinal strands, then twinkle each mote over time.
+    float clump = mix(1.0 - uClump, 1.0, valueNoise3(vec3(position.yz * 6.0, uTime * 0.15 + 7.3)));
+    float flicker = 1.0 - uFlicker * valueNoise3(
+      position * 4.0 + aSeed + vec3(0.0, 0.0, uTime * uFlickerSpeed));
+    vDensity = edge * clump * flicker;
+
+    // Turbulent fbm drift, plus a bounded upward stream so wisps lift and trail.
+    float n1 = fbm3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
+    float n2 = fbm3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
     p.x += (n1 - 0.5) * uDrift;
     p.y += (n2 - 0.5) * uDrift;
     p.z += (n1 - 0.5) * uDepth;
     p.y += sin(uTime * 0.6 + aSeed * 6.2831) * uRise;
+    p.y += (0.5 + 0.5 * sin(uTime * 0.4 + aSeed * 6.2831)) * uStream;
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0) * mix(0.8, 1.0, vDensity);
   }
 `
 
@@ -229,8 +302,16 @@ const HAND_CAP_VERTEX = /* glsl */ `
   uniform float uSpread;
   uniform float uDrift;
   uniform float uRise;
+  uniform float uEdge;
+  uniform float uRagged;
+  uniform float uClump;
+  uniform float uFlicker;
+  uniform float uFlickerSpeed;
+  uniform float uStream;
   uniform float uPointScale;
   uniform float uOpacity;
+
+  varying float vDensity;
 
   ${NOISE3D_GLSL}
 
@@ -240,27 +321,45 @@ const HAND_CAP_VERTEX = /* glsl */ `
     p.y = position.y * uHeight * uSpread;
     p.z = position.z * uDepth;
 
-    // Independent drift per particle; time is the third axis so neighbours flow together.
-    float n1 = valueNoise3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
-    float n2 = valueNoise3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
+    // The hand is seeded in a box, so without help it reads as a rigid rectangle. Feather the
+    // density to zero toward the box edge and perturb that edge with noise, so the hand frays
+    // into an irregular, dusty silhouette instead of a hard-cornered slab.
+    float r = length(position.xy * 2.0);
+    r += (valueNoise3(position * 3.0) - 0.5) * uRagged;
+    // uEdge is the feather width: small keeps a crisp edge, large fades from the centre out.
+    float feather = clamp(uEdge, 0.02, 1.0);
+    float edge = 1.0 - smoothstep(1.0 - feather, 1.0, r);
+
+    // Break the uniform interior into drifting strands, then twinkle individual motes.
+    float clump = mix(1.0 - uClump, 1.0, valueNoise3(vec3(position.xy * 5.0, uTime * 0.15 + 7.3)));
+    float flicker = 1.0 - uFlicker * valueNoise3(
+      position * 4.0 + aSeed + vec3(0.0, 0.0, uTime * uFlickerSpeed));
+    vDensity = edge * clump * flicker;
+
+    // Turbulent fbm drift plus a bounded upward stream, so the cloud streams and trails.
+    float n1 = fbm3(vec3(p.xy * 1.7 + aSeed, uTime * 0.22));
+    float n2 = fbm3(vec3(p.xy * 1.4 + aSeed * 1.7, uTime * 0.18 + 4.2));
     p.x += (n1 - 0.5) * uDrift;
     p.y += (n2 - 0.5) * uDrift;
     p.z += (n1 - 0.5) * uDepth;
     p.y += sin(uTime * 0.6 + aSeed * 6.2831) * uRise;
+    p.y += (0.5 + 0.5 * sin(uTime * 0.4 + aSeed * 6.2831)) * uStream;
 
     gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
-    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0);
+    gl_PointSize = aSize * uPointScale * clamp(uOpacity * 1.5, 0.0, 1.0) * mix(0.8, 1.0, vDensity);
   }
 `
 
 /**
- * Head dust: a halo of particles whose rest positions are a unit annulus around the face. The
- * shader scales that ring by the measured face radius and lets it drift/shift upward, so the
- * same dust that lifts off the body also gathers around the head.
+ * Head dust: a halo of particles whose rest positions are a unit annulus around the face, plus a
+ * downward plume (`aTail` particles) that trails toward the shoulders. The shader scales both by
+ * the measured face radius and lets them drift/rise, so the head dust hugs the head and spills down
+ * into the torso instead of ending at the chin.
  */
 const HEAD_DUST_VERTEX = /* glsl */ `
   attribute float aSeed;
   attribute float aSize;
+  attribute float aTail;
 
   uniform float uTime;
   uniform float uRadius;
@@ -268,18 +367,33 @@ const HEAD_DUST_VERTEX = /* glsl */ `
   uniform float uDepth;
   uniform float uDrift;
   uniform float uRise;
+  uniform float uTail;
+  uniform float uTailWidth;
   uniform float uPointScale;
   uniform float uOpacity;
 
   ${NOISE3D_GLSL}
 
   void main() {
-    // position.xy is seeded in a unit annulus; scale it to the face radius, then overshoot so
-    // the dust hugs and spills past the outline rather than filling the face.
     vec3 p;
-    p.x = position.x * uRadius * uSpread;
-    p.y = position.y * uRadius * uSpread;
-    p.z = position.z * uDepth;
+
+    if (aTail > 0.5) {
+      // Downward plume: position.y runs 0 (just below the halo) → 1 (the tip), and position.x
+      // is the lateral factor. It tapers toward the shoulders so the head reads as connected.
+      float d = position.y;
+      float yTop = -0.6;
+      float y = mix(yTop, yTop - uTail, d) * uRadius * uSpread;
+      float width = mix(0.45, uTailWidth, d) * uRadius * uSpread;
+      p.x = position.x * width;
+      p.y = y;
+      p.z = position.z * uDepth;
+    } else {
+      // Halo: scale the unit annulus by the face radius, then overshoot so the dust hugs and
+      // spills past the outline rather than filling the face.
+      p.x = position.x * uRadius * uSpread;
+      p.y = position.y * uRadius * uSpread;
+      p.z = position.z * uDepth;
+    }
 
     // Independent drift per particle, plus a slow rise so dust lifts off the head.
     float n1 = valueNoise3(vec3(p.xy * 2.2 + aSeed, uTime * 0.22));
@@ -338,7 +452,9 @@ function createDust(spec, pixelRatio) {
   const sizes = new Float32Array(count)
 
   for (let i = 0; i < count; i += 1) {
-    positions[i * 3] = Math.random() - 0.5
+    // x: triangular around the spine, so the torso core is dense and the sides fray into wisps
+    // instead of ending at a hard, box-like edge. y is the hip→shoulder axis, z the depth.
+    positions[i * 3] = (Math.random() + Math.random() - 1) * 0.5
     positions[i * 3 + 1] = Math.random() - 0.5
     positions[i * 3 + 2] = Math.random() - 0.5
     seeds[i] = Math.random()
@@ -358,6 +474,7 @@ function createDust(spec, pixelRatio) {
     uHipWidth: { value: 0.4 },
     uTorsoHeight: { value: 0.5 },
     uSpread: { value: spec.dustSpread },
+    uWaist: { value: spec.waistPinch },
     uDepth: { value: spec.depth },
     uDrift: { value: spec.drift },
     uRise: { value: spec.rise },
@@ -413,13 +530,19 @@ function createHandArm(spec, pixelRatio) {
     uSpread: { value: spec.handDustSpread },
     uDrift: { value: spec.handDrift },
     uRise: { value: spec.handRise },
+    uEdge: { value: spec.handEdgeSoftness },
+    uRagged: { value: spec.handRagged },
+    uClump: { value: spec.handClump },
+    uFlicker: { value: spec.handFlicker },
+    uFlickerSpeed: { value: spec.handFlickerSpeed },
+    uStream: { value: spec.handStream },
     uPointScale: { value: spec.handParticleRadius * pixelRatio },
   }
 
   const material = new THREE.ShaderMaterial({
     uniforms,
     vertexShader: HAND_ARM_VERTEX,
-    fragmentShader: DUST_FRAGMENT,
+    fragmentShader: WISP_FRAGMENT,
     transparent: true,
     depthTest: false,
     depthWrite: false,
@@ -466,13 +589,19 @@ function createHandCap(spec, pixelRatio) {
     uSpread: { value: spec.handCapSpread },
     uDrift: { value: spec.handDrift },
     uRise: { value: spec.handRise },
+    uEdge: { value: spec.handEdgeSoftness },
+    uRagged: { value: spec.handRagged },
+    uClump: { value: spec.handClump },
+    uFlicker: { value: spec.handFlicker },
+    uFlickerSpeed: { value: spec.handFlickerSpeed },
+    uStream: { value: spec.handStream },
     uPointScale: { value: spec.handCapSize * pixelRatio },
   }
 
   const material = new THREE.ShaderMaterial({
     uniforms,
     vertexShader: HAND_CAP_VERTEX,
-    fragmentShader: DUST_FRAGMENT,
+    fragmentShader: WISP_FRAGMENT,
     transparent: true,
     depthTest: false,
     depthWrite: false,
@@ -493,14 +622,25 @@ function createHeadDust(spec, pixelRatio) {
   const positions = new Float32Array(count * 3)
   const seeds = new Float32Array(count)
   const sizes = new Float32Array(count)
+  const tails = new Float32Array(count)
 
   for (let i = 0; i < count; i += 1) {
-    // Seed an annulus (0.55–1.0 of the unit radius) so the halo hugs and spreads past the face.
-    const angle = Math.random() * Math.PI * 2
-    const radius = 0.55 + Math.random() * 0.45
-    positions[i * 3] = Math.cos(angle) * radius
-    positions[i * 3 + 1] = Math.sin(angle) * radius
-    positions[i * 3 + 2] = Math.random() - 0.5
+    if (Math.random() < 0.4) {
+      // Downward-plume particle: `position.y` is the depth down the plume (0 near the halo → 1 at
+      // the tip), `position.x` the lateral factor. The shader tapers it toward the shoulders.
+      tails[i] = 1
+      positions[i * 3] = Math.random() * 2 - 1
+      positions[i * 3 + 1] = Math.random()
+      positions[i * 3 + 2] = Math.random() - 0.5
+    } else {
+      // Annulus (0.55–1.0 of the unit radius) so the halo hugs and spreads past the face.
+      tails[i] = 0
+      const angle = Math.random() * Math.PI * 2
+      const radius = 0.55 + Math.random() * 0.45
+      positions[i * 3] = Math.cos(angle) * radius
+      positions[i * 3 + 1] = Math.sin(angle) * radius
+      positions[i * 3 + 2] = Math.random() - 0.5
+    }
     seeds[i] = Math.random()
     sizes[i] = 0.4 + Math.random() * 0.9
   }
@@ -509,6 +649,7 @@ function createHeadDust(spec, pixelRatio) {
   geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
   geometry.setAttribute('aSeed', new THREE.BufferAttribute(seeds, 1))
   geometry.setAttribute('aSize', new THREE.BufferAttribute(sizes, 1))
+  geometry.setAttribute('aTail', new THREE.BufferAttribute(tails, 1))
 
   const uniforms = {
     uTime: { value: 0 },
@@ -519,6 +660,8 @@ function createHeadDust(spec, pixelRatio) {
     uDepth: { value: spec.depth },
     uDrift: { value: spec.headDustDrift },
     uRise: { value: spec.headDustRise },
+    uTail: { value: spec.headDustTail },
+    uTailWidth: { value: spec.headDustTailWidth },
     uPointScale: { value: spec.headDustSize * pixelRatio },
   }
 
@@ -758,42 +901,66 @@ function carveMask(px, py, polygons, softness) {
 }
 
 /**
+ * Resolve the normalised-landmark → world mapping for the current frame.
+ *
+ * `sx`/`sy` are world units per normalised unit. With `aspectFit: 'fill'`, x and y map straight
+ * onto the frame (stretches to fit). With `aspectFit: 'contain'`, the camera's aspect is kept, so
+ * the figure is never stretched: it fits inside the frame and is letterboxed on the long axis.
+ * `scale` is a uniform multiplier applied on top of either mode.
+ *
+ * Returns null when the viewport metrics are not finite, so callers can treat the frame as "not
+ * yet" instead of writing NaN into a position buffer.
+ */
+function computeFrame(view, { scale, aspectFit, camAspect }) {
+  const halfWidth = view?.halfWidth
+  const halfHeight = view?.halfHeight
+  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return null
+
+  const frameWidth = halfWidth * 2
+  const frameHeight = halfHeight * 2
+
+  let sx = frameWidth * scale
+  let sy = frameHeight * scale
+
+  if (aspectFit === 'contain' && Number.isFinite(camAspect) && camAspect > 0) {
+    // Fit the camera-aspect rectangle inside the frame: never exceed either dimension.
+    sx = Math.min(frameWidth, frameHeight * camAspect) * scale
+    sy = sx / camAspect
+  }
+
+  return { sx, sy }
+}
+
+/**
  * Normalised image coords → mirror-frame world coords.
  *
  * `x` is flipped (`0.5 - x`) because the persona replaces the player's *mirror* image, and
- * scaled by the full frame width so it matches the orthographic frustum. `y` is flipped for
- * the same reason: image space grows downward, world space grows upward.
+ * scaled by the frame mapping so it matches the orthographic frustum. `y` is flipped for the
+ * same reason: image space grows downward, world space grows upward.
  */
-function toWorld(landmark, view) {
-  if (!landmark) return null
+function toWorld(landmark, frame) {
+  if (!landmark || !frame) return null
 
   const { x, y } = landmark
-  const halfWidth = view?.halfWidth
-  const halfHeight = view?.halfHeight
-
-  // A single non-finite landmark coordinate, or a zero-size viewport that made the aspect
-  // non-finite, would poison a position buffer and make the renderer's bounding-sphere pass
-  // (used for depth sorting) log "Computed radius is NaN". Treat those frames as "not yet".
   if (!Number.isFinite(x) || !Number.isFinite(y)) return null
-  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return null
 
   return {
-    x: (0.5 - x) * halfWidth * 2,
-    y: (0.5 - y) * halfHeight * 2,
+    x: (0.5 - x) * frame.sx,
+    y: (0.5 - y) * frame.sy,
   }
 }
 
-function updateTorso(landmarks, view, torso, dustUniforms) {
-  const left = toWorld(landmarks[POSE_LANDMARKS.LEFT_SHOULDER], view)
-  const right = toWorld(landmarks[POSE_LANDMARKS.RIGHT_SHOULDER], view)
-  if (!left || !right) return
+function updateTorso(landmarks, frame, torso, dustUniforms) {
+  const left = toWorld(landmarks[POSE_LANDMARKS.LEFT_SHOULDER], frame)
+  const right = toWorld(landmarks[POSE_LANDMARKS.RIGHT_SHOULDER], frame)
+  if (!left || !right) return null
 
-  const leftHip = toWorld(landmarks[POSE_LANDMARKS.LEFT_HIP], view)
-  const rightHip = toWorld(landmarks[POSE_LANDMARKS.RIGHT_HIP], view)
+  const leftHip = toWorld(landmarks[POSE_LANDMARKS.LEFT_HIP], frame)
+  const rightHip = toWorld(landmarks[POSE_LANDMARKS.RIGHT_HIP], frame)
 
   const shoulderMid = midpoint(left, right)
   const shoulderWidth = distance(left, right)
-  if (shoulderWidth < 1e-4) return
+  if (shoulderWidth < 1e-4) return null
 
   let hipMid = null
   let hipWidth = 0
@@ -856,7 +1023,7 @@ function updateHeadDust(faceStatus, headDust, depth) {
  * Everything happens on the CPU so the carve tests the exact position that gets rendered. Returns
  * the face bounds so the head halo can follow it.
  */
-function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spec) {
+function updateFaceDust(faceLandmarks, faceDust, regions, frame, depth, time, spec) {
   const { points, geometry, count, layout } = faceDust
 
   if (!count) {
@@ -868,9 +1035,9 @@ function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spe
     return { visible: false, reason: 'no-face', total: count }
   }
 
-  const halfWidth = view?.halfWidth
-  const halfHeight = view?.halfHeight
-  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) {
+  const sx = frame?.sx
+  const sy = frame?.sy
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
     points.visible = false
     return { visible: false, reason: 'non-finite view', total: count }
   }
@@ -883,8 +1050,6 @@ function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spe
   }
   const worldX = faceDust.worldX
   const worldY = faceDust.worldY
-  const fullWidth = halfWidth * 2
-  const fullHeight = halfHeight * 2
 
   for (let i = 0; i < landmarkCount; i += 1) {
     const landmark = faceLandmarks[i]
@@ -893,8 +1058,8 @@ function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spe
       worldY[i] = NaN
       continue
     }
-    worldX[i] = (0.5 - landmark.x) * fullWidth
-    worldY[i] = (0.5 - landmark.y) * fullHeight
+    worldX[i] = (0.5 - landmark.x) * sx
+    worldY[i] = (0.5 - landmark.y) * sy
   }
 
   const polygons = buildCarveRegions(regions, worldX, worldY)
@@ -985,13 +1150,10 @@ function updateFaceDust(faceLandmarks, faceDust, regions, view, depth, time, spe
 }
 
 /** World-space bounding box of a hand's 21 landmarks, or null when it cannot be measured. */
-function handBounds(handLandmarks, view) {
-  const halfWidth = view?.halfWidth
-  const halfHeight = view?.halfHeight
-  if (!Number.isFinite(halfWidth) || !Number.isFinite(halfHeight)) return null
-
-  const fullWidth = halfWidth * 2
-  const fullHeight = halfHeight * 2
+function handBounds(handLandmarks, frame) {
+  const sx = frame?.sx
+  const sy = frame?.sy
+  if (!Number.isFinite(sx) || !Number.isFinite(sy)) return null
 
   let minX = Infinity
   let maxX = -Infinity
@@ -1004,8 +1166,8 @@ function handBounds(handLandmarks, view) {
     const { x, y } = landmark
     if (!Number.isFinite(x) || !Number.isFinite(y)) continue
 
-    const worldX = (0.5 - x) * fullWidth
-    const worldY = (0.5 - y) * fullHeight
+    const worldX = (0.5 - x) * sx
+    const worldY = (0.5 - y) * sy
     minX = Math.min(minX, worldX)
     maxX = Math.max(maxX, worldX)
     minY = Math.min(minY, worldY)
@@ -1080,7 +1242,7 @@ function updateHandCap(handBox, handCap, spec) {
  * shoulder the other hand picks the remaining one, which keeps the two arms from collapsing
  * onto the same side of the body.
  */
-function updateHands(landmarks, handLandmarks, handUnits, view, spec) {
+function updateHands(landmarks, handLandmarks, handUnits, frame, spec) {
   const statuses = handUnits.map(() => ({ visible: false, reason: 'no-hand', cap: false }))
   if (!handUnits.length) return statuses
 
@@ -1089,16 +1251,16 @@ function updateHands(landmarks, handLandmarks, handUnits, view, spec) {
     unit.cap.points.visible = false
   }
 
-  const left = toWorld(landmarks?.[POSE_LANDMARKS.LEFT_SHOULDER], view)
-  const right = toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_SHOULDER], view)
+  const left = toWorld(landmarks?.[POSE_LANDMARKS.LEFT_SHOULDER], frame)
+  const right = toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_SHOULDER], frame)
   if (!left || !right) {
     return statuses.map(() => ({ visible: false, reason: 'no-shoulders', cap: false }))
   }
 
   const shoulders = [left, right]
   const elbows = [
-    toWorld(landmarks?.[POSE_LANDMARKS.LEFT_ELBOW], view),
-    toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_ELBOW], view),
+    toWorld(landmarks?.[POSE_LANDMARKS.LEFT_ELBOW], frame),
+    toWorld(landmarks?.[POSE_LANDMARKS.RIGHT_ELBOW], frame),
   ]
   const shoulderWidth = distance(left, right)
   const claimed = new Set()
@@ -1108,7 +1270,7 @@ function updateHands(landmarks, handLandmarks, handUnits, view, spec) {
     const hand = handLandmarks?.[i]
     if (!hand) continue
 
-    const box = handBounds(hand, view)
+    const box = handBounds(hand, frame)
     if (!box) {
       statuses[i] = { visible: false, reason: 'no-hand-bounds', cap: false }
       continue
@@ -1219,8 +1381,13 @@ function findNonFiniteVertex(geometry) {
  * @param {Partial<typeof FACE_DUST_DEFAULTS>} [options.face] per-call face overrides
  * @param {Partial<typeof TORSO_DEFAULTS>} [options.torso] per-call torso-layer overrides
  * @param {Partial<typeof HAND_DEFAULTS>} [options.hand] per-call hand-dust overrides
+ * @param {Partial<typeof HEAD_DUST_DEFAULTS>} [options.head] per-call head-dust overrides
  * @param {number} [options.handCount] number of hand-dust clouds to preallocate (one per hand)
  * @param {number} [options.pixelRatio] device pixel ratio for point sizing
+ * @param {number} [options.scale] uniform figure-size multiplier (defaults to `PERSONA.scale`)
+ * @param {'contain'|'fill'} [options.aspectFit] normalised-frame mapping (defaults to
+ *   `PERSONA.aspectFit`)
+ * @param {number} [options.camAspect] camera aspect, used by `'contain'` (defaults to `CAMERA`)
  */
 export function createPersona({
   view,
@@ -1230,14 +1397,23 @@ export function createPersona({
   face = {},
   torso: torsoOverrides = {},
   hand: handOverrides = {},
+  head: headOverrides = {},
   handCount = 2,
   pixelRatio = Math.min(globalThis.devicePixelRatio || 1, 2),
+  scale = PERSONA.scale ?? 1,
+  aspectFit = PERSONA.aspectFit ?? 'contain',
+  camAspect = CAMERA.width / CAMERA.height,
 }) {
-  // Face/torso/hand layers read from a merged spec so any value can be overridden at the call
-  // site, while everything not passed falls back to the current config values.
+  // Face/torso/hand/head layers read from a merged spec so any value can be overridden at the
+  // call site, while everything not passed falls back to the current config values.
   const faceSpec = { ...FACE_DUST_DEFAULTS, ...face }
   const torsoSpec = { ...TORSO_DEFAULTS, ...torsoOverrides }
   const handSpec = { ...HAND_DEFAULTS, ...handOverrides }
+  const headSpec = { ...HEAD_DUST_DEFAULTS, ...headOverrides }
+  // Live mapping/size spec: sliders write straight into this and `update()` re-reads it each
+  // frame, so scale/aspectFit changes apply without a reload.
+  const figureSpec = { scale, aspectFit, camAspect }
+  const initialPointScale = pixelRatio * figureSpec.scale
   // Guard against passing the renderer API instead of its `view` metrics (a silent mismatch:
   // halfWidth/halfHeight read as undefined and nothing maps).
   if (!Number.isFinite(view?.halfWidth) || !Number.isFinite(view?.halfHeight)) {
@@ -1252,30 +1428,30 @@ export function createPersona({
   const torso = new THREE.Group()
   root.add(torso)
 
-  const dust = createDust(torsoSpec, pixelRatio)
+  const dust = createDust(torsoSpec, initialPointScale)
   torso.add(dust.points)
 
-  const faceDust = createFaceDust(faceTriangles, faceSpec, pixelRatio)
+  const faceDust = createFaceDust(faceTriangles, faceSpec, initialPointScale)
   root.add(faceDust.points)
 
   // A separate halo around the head; it lives in root (not the torso group) because it follows
   // the face, not the shoulders.
-  const headDust = createHeadDust(spec, pixelRatio)
+  const headDust = createHeadDust(headSpec, initialPointScale)
   root.add(headDust.points)
 
   // Two arm capsules (upper, forearm) plus one bright hand cap per hand, preallocated so a hand
   // entering/leaving the frame just toggles visibility instead of reallocating geometry.
   const handUnits = []
   for (let i = 0; i < handCount; i += 1) {
-    const upper = createHandArm(handSpec, pixelRatio)
+    const upper = createHandArm(handSpec, initialPointScale)
     upper.points.name = `handArmUpper${i}`
     root.add(upper.points)
 
-    const fore = createHandArm(handSpec, pixelRatio)
+    const fore = createHandArm(handSpec, initialPointScale)
     fore.points.name = `handArmFore${i}`
     root.add(fore.points)
 
-    const cap = createHandCap(handSpec, pixelRatio)
+    const cap = createHandCap(handSpec, initialPointScale)
     cap.points.name = `handCap${i}`
     root.add(cap.points)
 
@@ -1338,12 +1514,18 @@ export function createPersona({
 
     root.visible = opacity > 0.002
 
+    // Live mapping and point-size scale: re-read every frame so the debug sliders apply without
+    // a reload. `pointScale` keeps the dust sprites proportional to the figure.
+    const pointScale = pixelRatio * figureSpec.scale
+    const frame = computeFrame(view, figureSpec)
+
+    dust.uniforms.uTime.value = time
     dust.uniforms.uTime.value = time
     headDust.uniforms.uTime.value = time
     faceDust.uniforms.uTime.value = time
 
     dust.uniforms.uOpacity.value = opacity * torsoSpec.dustOpacity
-    headDust.uniforms.uOpacity.value = opacity * spec.headDustOpacity
+    headDust.uniforms.uOpacity.value = opacity * headSpec.headDustOpacity
     faceDust.uniforms.uOpacity.value = opacity * faceSpec.faceDustOpacity
 
     for (const { arms, cap } of handUnits) {
@@ -1358,10 +1540,11 @@ export function createPersona({
     // Re-apply the dust uniforms every frame so the debug sliders can tune them live.
     // `particleCount` and the colours are structural / init-time values.
     dust.uniforms.uSpread.value = torsoSpec.dustSpread
+    dust.uniforms.uWaist.value = torsoSpec.waistPinch
     dust.uniforms.uDepth.value = torsoSpec.depth
     dust.uniforms.uDrift.value = torsoSpec.drift
     dust.uniforms.uRise.value = torsoSpec.rise
-    dust.uniforms.uPointScale.value = torsoSpec.particleRadius * pixelRatio
+    dust.uniforms.uPointScale.value = torsoSpec.particleRadius * pointScale
 
     // Re-apply the hand uniforms every frame so the debug sliders can tune them live. Counts and
     // colours are structural / init-time values.
@@ -1372,7 +1555,13 @@ export function createPersona({
         arm.uniforms.uDepth.value = handSpec.handDepth
         arm.uniforms.uDrift.value = handSpec.handDrift
         arm.uniforms.uRise.value = handSpec.handRise
-        arm.uniforms.uPointScale.value = handSpec.handParticleRadius * pixelRatio
+        arm.uniforms.uEdge.value = handSpec.handEdgeSoftness
+        arm.uniforms.uRagged.value = handSpec.handRagged
+        arm.uniforms.uClump.value = handSpec.handClump
+        arm.uniforms.uFlicker.value = handSpec.handFlicker
+        arm.uniforms.uFlickerSpeed.value = handSpec.handFlickerSpeed
+        arm.uniforms.uStream.value = handSpec.handStream
+        arm.uniforms.uPointScale.value = handSpec.handParticleRadius * pointScale
       }
 
       cap.uniforms.uColor.value.set(handSpec.handCapColor)
@@ -1380,12 +1569,28 @@ export function createPersona({
       cap.uniforms.uDepth.value = handSpec.handDepth
       cap.uniforms.uDrift.value = handSpec.handDrift
       cap.uniforms.uRise.value = handSpec.handRise
-      cap.uniforms.uPointScale.value = handSpec.handCapSize * pixelRatio
+      cap.uniforms.uEdge.value = handSpec.handEdgeSoftness
+      cap.uniforms.uRagged.value = handSpec.handRagged
+      cap.uniforms.uClump.value = handSpec.handClump
+      cap.uniforms.uFlicker.value = handSpec.handFlicker
+      cap.uniforms.uFlickerSpeed.value = handSpec.handFlickerSpeed
+      cap.uniforms.uStream.value = handSpec.handStream
+      cap.uniforms.uPointScale.value = handSpec.handCapSize * pointScale
     }
+
+    // Head halo: re-apply every uniform each frame so its debug sliders tune it live. The count
+    // is structural and the colour is init-time, so neither gets a slider.
+    headDust.uniforms.uSpread.value = headSpec.headDustSpread
+    headDust.uniforms.uDepth.value = headSpec.depth
+    headDust.uniforms.uDrift.value = headSpec.headDustDrift
+    headDust.uniforms.uRise.value = headSpec.headDustRise
+    headDust.uniforms.uTail.value = headSpec.headDustTail
+    headDust.uniforms.uTailWidth.value = headSpec.headDustTailWidth
+    headDust.uniforms.uPointScale.value = headSpec.headDustSize * pointScale
 
     // Re-apply the face uniforms every frame so the debug sliders can tune them live. Structural
     // values (`faceDustCount`) still need a reload.
-    faceDust.uniforms.uPointScale.value = faceSpec.faceDustSize * pixelRatio
+    faceDust.uniforms.uPointScale.value = faceSpec.faceDustSize * pointScale
     faceDust.uniforms.uColor.value.set(faceSpec.faceColor)
 
     if (!root.visible) {
@@ -1398,20 +1603,20 @@ export function createPersona({
       }
     }
 
-    if (landmarks) updateTorso(landmarks, view, torso, dust.uniforms)
+    if (landmarks) updateTorso(landmarks, frame, torso, dust.uniforms)
 
     const faceStatus = updateFaceDust(
       faceLandmarks,
       faceDust,
       faceRegions,
-      view,
+      frame,
       faceSpec.faceDepth,
       time,
       faceSpec,
     )
 
     updateHeadDust(faceStatus, headDust, faceSpec.faceDepth)
-    const hands = updateHands(landmarks, handLandmarks, handUnits, view, handSpec)
+    const hands = updateHands(landmarks, handLandmarks, handUnits, frame, handSpec)
 
     debugCheckGeometry()
 
@@ -1440,7 +1645,16 @@ export function createPersona({
     faceDust.points.material.dispose()
   }
 
-  // `face` / `torso` / `hand` are the live, mutable specs: the debug sliders write straight into
-  // them and the next `update()` picks the values up.
-  return { group: root, face: faceSpec, torso: torsoSpec, hand: handSpec, update, dispose }
+  // `face` / `torso` / `hand` / `head` / `figure` are the live, mutable specs: the debug sliders
+  // write straight into them and the next `update()` picks the values up.
+  return {
+    group: root,
+    face: faceSpec,
+    torso: torsoSpec,
+    hand: handSpec,
+    head: headSpec,
+    figure: figureSpec,
+    update,
+    dispose,
+  }
 }

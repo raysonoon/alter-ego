@@ -105,7 +105,7 @@ export const HAND = {
   /** Sprite radius in px, before the device pixel ratio. */
   particleRadius: 4,
   dustColor: 0x8fb4e0,
-  dustOpacity: 0.75,
+  dustOpacity: 1,
   /** Dust may spill past the hand's bounding box so the edge reads as unravelling. */
   dustSpread: 1.35,
   /**
@@ -114,7 +114,7 @@ export const HAND = {
    * as a fraction of shoulder width, `armElbowTaper` the elbow radius as a fraction of that base,
    * and `armTaper` the hand-end radius as a fraction of the base.
    */
-  armThickness: 0.22,
+  armThickness: 0.21,
   armElbowTaper: 0.75,
   armTaper: 0.55,
   /**
@@ -123,13 +123,27 @@ export const HAND = {
    */
   capCount: 180,
   capSize: 6,
-  capOpacity: 0.95,
-  capColor: 0xcfe8ff,
-  capSpread: 1.5,
+  capOpacity: 0.9,
+  capColor: 0x9fd8ff,
+  capSpread: 1.1,
   /** Cloud thickness / z-offset in front of the torso. */
   depth: 0.04,
-  drift: 0.015,
-  rise: 0.008,
+  drift: 0.05,
+  rise: 0.03,
+  /**
+   * Wisp shaping. The hand is seeded in a box, so without these it reads as a rigid rectangle.
+   * `edgeSoftness` is the feather width: 0 keeps a crisp edge and 1 fades out from the centre,
+   * `ragged` perturbs that edge with noise so it frays irregularly, and `clump` breaks the
+   * uniform interior into drifting strands. `flicker` and `flickerSpeed` make individual motes
+   * twinkle in and out like dust. All are live-tunable.
+   */
+  edgeSoftness: 0.5,
+  ragged: 0.25,
+  clump: 0.5,
+  flicker: 0.8,
+  flickerSpeed: 1.5,
+  /** Slow, bounded upward drift so wisps lift and trail instead of shivering in place. */
+  stream: 0.02,
   /**
    * Smallest hand bounding-box span (world units) we still draw. A cropped, partially-tracked
    * hand would otherwise collapse to a point and flash a dot at the frame edge.
@@ -206,33 +220,44 @@ export const EXTEND_HAND = {
  * The colours are deliberately low-luminance to replace the reflection
  */
 export const PERSONA = {
-  dustColor: 0x6f8fc4,
+  dustColor: 0x8fb4e0,
   faceColor: 0x9fd8ff,
 
   /** Peak alphas for each layer, before the materialise/dissolve ramp. */
-  dustOpacity: 0.9,
+  dustOpacity: 0.55,
 
   /** Dust cloud. */
   particleCount: 900,
-  particleRadius: 7,
+  particleRadius: 4.5,
   /** Dust may spill past the silhouette edge so the body reads as unravelling. */
   dustSpread: 1.22,
+  /**
+   * Subtle waist pinch: the fraction the silhouette narrows around the chest. 0 makes the torso a
+   * straight taper hip→shoulder; higher values curve the sides in for an organic body shape.
+   */
+  waistPinch: 0.25,
   /** Torso thickness and per-particle drift, in mirror-frame world units. */
   depth: 0.22,
   drift: 0.05,
-  rise: 0.04,
+  rise: 0.07,
 
   /**
    * Head dust: a second cloud seeded in a ring around the face so the dust spreads around the
-   * head too. Positions are seeded at 0.55–1.0 of the face radius, then pushed out by `spread`.
+   * head too, plus a downward plume that trails toward the shoulders. Positions are seeded at
+   * 0.55–1.0 of the face radius, then pushed out by `spread`. `headDustTail` is how far the plume
+   * hangs below the face centre as a fraction of the face radius, and `headDustTailWidth` its
+   * half-width at the tip (also a fraction of the radius), so the head reads as connected to the
+   * body.
    */
   headDustCount: 260,
   headDustSpread: 1.5,
   headDustSize: 5,
   headDustOpacity: 0.5,
   headDustDrift: 0.15,
-  headDustRise: 0.04,
+  headDustRise: 0.06,
   headDustColor: 0x8fb4e0,
+  headDustTail: 0.4,
+  headDustTailWidth: 0.7,
 
   /** Opacity ramp time constants (seconds) for appearing and dissolving. */
   appearTau: 0.5,
@@ -244,12 +269,27 @@ export const PERSONA = {
    * feature's edge (0 = hard cut), so the empty shapes read as soft voids rather than stamps.
    */
   faceDustCount: 750,
-  faceDustSize: 5,
+  faceDustSize: 4.25,
   faceDustOpacity: 0.55,
-  faceDustDrift: 0.012,
+  faceDustDrift: 0.015,
   faceDustRise: 0.006,
-  faceCarveSoftness: 0.02,
+  faceCarveSoftness: 0.005,
 
   /** How far in front of the torso the face sits. */
   faceDepth: 0.06,
+
+  /**
+   * Figure scale: a uniform multiplier on the whole persona (torso, face, hands and halo) and on
+   * the dust point sizes. 1 sizes the figure to the frame; <1 shrinks it, >1 grows it.
+   */
+  scale: 2.5,
+
+  /**
+   * How the normalised camera frame maps onto the mirror frame:
+   *   - 'contain' keeps the camera's aspect, so the figure is never stretched; it fits inside
+   *     the frame and is letterboxed on the long axis. The right choice for a portrait monitor
+   *     driven by a landscape webcam;
+   *   - 'fill' maps x/y straight onto the frame (stretches to fit) — the historical behaviour.
+   */
+  aspectFit: 'contain',
 }

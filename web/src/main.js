@@ -79,6 +79,7 @@ const FACE_DUST_SLIDERS = [
 const TORSO_SLIDERS = [
   { key: 'dustOpacity', label: 'dust opacity', min: 0, max: 1, step: 0.01 },
   { key: 'dustSpread', label: 'dust spread', min: 0.5, max: 2.5, step: 0.01 },
+  { key: 'waistPinch', label: 'waist pinch', min: 0, max: 0.8, step: 0.01 },
   { key: 'depth', label: 'depth', min: 0, max: 0.6, step: 0.01 },
   { key: 'drift', label: 'drift', min: 0, max: 0.3, step: 0.005 },
   { key: 'rise', label: 'rise', min: 0, max: 0.2, step: 0.005 },
@@ -101,8 +102,38 @@ const HAND_SLIDERS = [
   { key: 'handDepth', label: 'depth', min: 0, max: 0.4, step: 0.01 },
   { key: 'handDrift', label: 'drift', min: 0, max: 0.2, step: 0.005 },
   { key: 'handRise', label: 'rise', min: 0, max: 0.1, step: 0.005 },
+  { key: 'handEdgeSoftness', label: 'edge softness', min: 0, max: 1, step: 0.01 },
+  { key: 'handRagged', label: 'ragged edge', min: 0, max: 0.8, step: 0.01 },
+  { key: 'handClump', label: 'clump', min: 0, max: 1, step: 0.01 },
+  { key: 'handFlicker', label: 'flicker', min: 0, max: 1, step: 0.01 },
+  { key: 'handFlickerSpeed', label: 'flicker speed', min: 0, max: 5, step: 0.1 },
+  { key: 'handStream', label: 'stream', min: 0, max: 0.1, step: 0.002 },
   { key: 'handParticleRadius', label: 'dust size', min: 1, max: 20, step: 0.5 },
   { key: 'handMinSpan', label: 'min span', min: 0, max: 0.5, step: 0.01 },
+]
+
+/**
+ * Live head-dust sliders, writing straight into the persona's mutable `head` spec. `headDustCount`
+ * and `headDustColor` are structural / init-time values, so they're excluded.
+ */
+const HEAD_DUST_SLIDERS = [
+  { key: 'headDustOpacity', label: 'opacity', min: 0, max: 1, step: 0.01 },
+  { key: 'headDustSpread', label: 'spread', min: 0.5, max: 3, step: 0.01 },
+  { key: 'headDustSize', label: 'point size', min: 1, max: 20, step: 0.5 },
+  { key: 'headDustDrift', label: 'drift', min: 0, max: 0.3, step: 0.005 },
+  { key: 'headDustRise', label: 'rise', min: 0, max: 0.2, step: 0.005 },
+  { key: 'headDustTail', label: 'tail length', min: 0, max: 3, step: 0.05 },
+  { key: 'headDustTailWidth', label: 'tail width', min: 0.05, max: 0.8, step: 0.01 },
+  { key: 'depth', label: 'depth', min: 0, max: 0.6, step: 0.01 },
+]
+
+/**
+ * Live figure-mapping sliders, writing straight into the persona's mutable `figure` spec.
+ * `scale` resizes the whole persona (torso, face, hands, halo) and its dust sprites live.
+ * `aspectFit` is a string mode, so it stays a config value rather than a slider.
+ */
+const FIGURE_SLIDERS = [
+  { key: 'scale', label: 'figure scale', min: 0.2, max: 4, step: 0.01 },
 ]
 
 /**
@@ -177,6 +208,14 @@ function createHandControls(persona) {
   getDebugStack().appendChild(createSliderPanel('hand', HAND_SLIDERS, persona.hand))
 }
 
+function createHeadControls(persona) {
+  getDebugStack().appendChild(createSliderPanel('head dust', HEAD_DUST_SLIDERS, persona.head))
+}
+
+function createFigureControls(persona) {
+  getDebugStack().appendChild(createSliderPanel('figure', FIGURE_SLIDERS, persona.figure))
+}
+
 const machine = createStateMachine()
 
 // Optional LED link to the Arduino. It reads the live state on (re)connect so the strip syncs
@@ -200,6 +239,8 @@ renderer.scene.add(persona.group)
 createFaceControls(persona)
 createTorsoControls(persona)
 createHandControls(persona)
+createHeadControls(persona)
+createFigureControls(persona)
 
 let camera
 let pose
@@ -345,6 +386,13 @@ async function boot() {
   // port, and it must not hold up the mirror booting.
   ledLink.autoConnect()
   camera = await startCamera()
+
+  // The browser may negotiate a feed size other than the requested 1280×720, so take the real
+  // aspect for the 'contain' mapping rather than trusting the config alone.
+  const feed = camera.video
+  if (feed?.videoWidth > 0 && feed?.videoHeight > 0) {
+    persona.figure.camAspect = feed.videoWidth / feed.videoHeight
+  }
 
   showStatus('loading models…')
   const [poseModel, gestureModel, faceModel] = await Promise.all([

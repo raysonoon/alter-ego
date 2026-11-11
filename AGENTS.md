@@ -23,8 +23,9 @@ Interaction loop (IDLE → APPROACH → EXIT TRIGGER) and hardware/optics detail
 - `src/main.js` boots the camera + the pose, gesture and face models, wires the pose distance
   and the extend-hand trigger into the state machine, and drives the scene each frame.
 - The `scene/` layer is built: `renderer.js` owns the black canvas and an orthographic camera
-  aligned to the mirror; `persona.js` renders the wispy, dusty figure — a shoulder→hip dust
-  cloud, a filled face-dust cloud carved around the eyes/nose/mouth, and a head-dust halo — and
+  aligned to the mirror; `persona.js` renders the wispy, dusty figure — a curved, waist-pinched
+  shoulder→hip dust cloud, a filled face-dust cloud carved around the eyes/nose/mouth, and a
+  head-dust halo with a downward plume that trails toward the shoulders — and
   only shows outside IDLE. It consumes normalised landmarks only (flipped horizontally to
   match the mirror) and is tuned through `PERSONA` in `src/config.js`. `src/audio/` and
   `scene/effects/glassBreak.js` are still to be written and will hang off the state machine's
