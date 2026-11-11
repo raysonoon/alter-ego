@@ -1498,15 +1498,18 @@ export function createPersona({
    * @param {Array<{x:number,y:number,z:number}>} [frame.landmarks] pose landmarks (normalised)
    * @param {Array<{x:number,y:number,z:number}>} [frame.faceLandmarks] face-mesh landmarks
    * @param {Array<Array<{x:number,y:number,z:number}>>} [frame.handLandmarks] per-hand landmark sets
-   * @param {string} frame.state current IDLE / APPROACH / EXIT state
+   * @param {string} frame.state current IDLE / APPROACH / ENTRY / EXIT state
+   * @param {number} [frame.proximity] 0–1 distance factor within APPROACH (0 far, 1 at ENTRY)
    * @param {number} [frame.dt] seconds since the previous frame
    */
-  function update({ landmarks, faceLandmarks, handLandmarks, state, dt = 0 } = {}) {
+  function update({ landmarks, faceLandmarks, handLandmarks, state, proximity = 1, dt = 0 } = {}) {
     const step = Math.min(Math.max(dt, 0), 0.25)
     time += step
 
-    // The figure exists only at the mirror; IDLE is the black mirror itself.
-    const active = state === 'IDLE' ? 0 : 1
+    // The figure exists only at the mirror; IDLE is the black mirror itself. In APPROACH it
+    // fades in with proximity, so it materialises as the player closes the gap to ENTRY.
+    const active =
+      state === 'IDLE' ? 0 : state === 'APPROACH' ? Math.max(0, Math.min(1, proximity)) : 1
     const tau = active > opacity ? spec.appearTau : spec.disappearTau
     opacity += (active - opacity) * (1 - Math.exp(-step / tau))
     if (opacity < 0.002) opacity = 0

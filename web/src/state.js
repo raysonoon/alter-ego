@@ -4,6 +4,7 @@ import { APPROACH } from './config.js'
 export const STATE = {
   IDLE: 'IDLE',
   APPROACH: 'APPROACH',
+  ENTRY: 'ENTRY',
   EXIT: 'EXIT',
 }
 
@@ -16,45 +17,59 @@ export const STATE = {
  */
 export const EVENT = {
   ENTER_APPROACH: 'enterApproach',
+  ENTER_ENTRY: 'enterEntry',
   ENTER_EXIT: 'enterExit',
   ENTER_IDLE: 'enterIdle',
 }
 
 /**
- * The IDLE → APPROACH → EXIT TRIGGER loop.
+ * The IDLE → APPROACH → ENTRY → EXIT TRIGGER loop.
  *
  * Pure and framework-free, like the extend-hand detector: it reads only a distance, a boolean
  * and a timestamp each frame and returns the new state plus any edge events, so it can be
  * driven by the live camera or by a scripted input sequence with no camera at all.
  *
- * This is where the loop's *policy* lives — the distance threshold and its hysteresis, how long
- * a range change must hold, how long the player must be gone before the mirror resets — while
- * vision/ only reports raw readings and geometry.
+ * The ladder has two distance zones. APPROACH is the outer band — the player is within
+ * `approachThreshold` but still more than `entryThreshold` away — and is the "someone is coming"
+ * cue. ENTRY is the inner zone (within `entryThreshold`), where the player counts as present at
+ * the mirror and the previous ≤1.2 m logic lives: the persona materialises and the extend-hand
+ * trigger fires the EXIT.
+ *
+ * This is where the loop's *policy* lives — the distance thresholds and their hysteresis, how
+ * long a range change must hold, how long the player must be gone before the mirror resets —
+ * while vision/ only reports raw readings and geometry.
  *
  * EXIT latches: once the extend-hand trigger fires, the state holds however the distance
  * changes, and resets to IDLE only when the player leaves the frame. IDLE ignores extend-hand
- * events entirely, and APPROACH only fires on the frame the trigger arrives.
+ * events entirely, and ENTRY only fires on the frame the trigger arrives.
  *
  * @param {typeof APPROACH} [config]
  */
 export function createStateMachine(config = APPROACH) {
-  const enterThreshold = config.distanceThreshold
-  const leaveThreshold = config.distanceThreshold + config.hysteresis
+  const approachEnter = config.approachThreshold
+  const approachLeave = config.approachThreshold + config.hysteresis
+  const entryEnter = config.entryThreshold
+  const entryLeave = config.entryThreshold + config.hysteresis
 
   let state = STATE.IDLE
-  let enterRangeSince = null
-  let leaveRangeSince = null
+  let approachRangeSince = null
+  let entryRangeSince = null
+  let approachLeaveSince = null
+  let entryLeaveSince = null
   let missingSince = null
 
   const enterEvent = {
     [STATE.APPROACH]: EVENT.ENTER_APPROACH,
+    [STATE.ENTRY]: EVENT.ENTER_ENTRY,
     [STATE.EXIT]: EVENT.ENTER_EXIT,
     [STATE.IDLE]: EVENT.ENTER_IDLE,
   }
 
   const clearTimers = () => {
-    enterRangeSince = null
-    leaveRangeSince = null
+    approachRangeSince = null
+    entryRangeSince = null
+    approachLeaveSince = null
+    entryLeaveSince = null
     missingSince = null
   }
 
@@ -75,13 +90,43 @@ export function createStateMachine(config = APPROACH) {
     const hasPerson = distance != null
 
     if (state === STATE.IDLE) {
-      if (hasPerson && distance <= enterThreshold) {
-        enterRangeSince ??= timestamp
-        if (timestamp - enterRangeSince >= config.debounceMs) transitionTo(STATE.APPROACH, events)
+      if (!hasPerson) {
+        approachRangeSince = null
+        entryRangeSince = null
+      } else if (distance <= entryEnter) {
+        // A player already inside ENTRY (e.g. at boot) enters it directly, keeping the old
+        // ≤1.2 m responsiveness instead of detouring through APPROACH first.
+        approachRangeSince = null
+        entryRangeSince ??= timestamp
+        if (timestamp - entryRangeSince >= config.debounceMs) transitionTo(STATE.ENTRY, events)
+      } else if (distance <= approachEnter) {
+        entryRangeSince = null
+        approachRangeSince ??= timestamp
+        if (timestamp - approachRangeSince >= config.debounceMs) transitionTo(STATE.APPROACH, events)
       } else {
-        enterRangeSince = null
+        approachRangeSince = null
+        entryRangeSince = null
       }
     } else if (state === STATE.APPROACH) {
+      if (!hasPerson) {
+        missingSince ??= timestamp
+        if (timestamp - missingSince >= config.lostMs) transitionTo(STATE.IDLE, events)
+      } else {
+        missingSince = null
+        if (distance <= entryEnter) {
+          entryRangeSince ??= timestamp
+          if (timestamp - entryRangeSince >= config.debounceMs) transitionTo(STATE.ENTRY, events)
+        } else {
+          entryRangeSince = null
+          if (distance > approachLeave) {
+            approachLeaveSince ??= timestamp
+            if (timestamp - approachLeaveSince >= config.debounceMs) transitionTo(STATE.IDLE, events)
+          } else {
+            approachLeaveSince = null
+          }
+        }
+      }
+    } else if (state === STATE.ENTRY) {
       if (extendHand) {
         transitionTo(STATE.EXIT, events)
       } else if (!hasPerson) {
@@ -89,11 +134,11 @@ export function createStateMachine(config = APPROACH) {
         if (timestamp - missingSince >= config.lostMs) transitionTo(STATE.IDLE, events)
       } else {
         missingSince = null
-        if (distance > leaveThreshold) {
-          leaveRangeSince ??= timestamp
-          if (timestamp - leaveRangeSince >= config.debounceMs) transitionTo(STATE.IDLE, events)
+        if (distance > entryLeave) {
+          entryLeaveSince ??= timestamp
+          if (timestamp - entryLeaveSince >= config.debounceMs) transitionTo(STATE.APPROACH, events)
         } else {
-          leaveRangeSince = null
+          entryLeaveSince = null
         }
       }
     } else if (state === STATE.EXIT) {

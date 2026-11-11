@@ -23,22 +23,63 @@ export const CAMERA = {
   facingMode: 'user',
   /** Debug aid: render the live feed as a corner thumbnail. Off in the final prop. */
   preview: true,
+  /**
+   * Lock the camera's exposure so bright LED light cannot make the webcam's auto-exposure swing
+   * and wash out the hand mid-reach. Chromium exposes manual exposure through the track;
+   * unsupported webcams keep their auto settings and the prop still runs. `exposureTime` is the
+   * value to lock to (platform units) — `null` locks to whatever the camera chose at boot, under
+   * the ambient light, which is usually the right call. The console logs the usable range.
+   */
+  lockExposure: true,
+  exposureTime: null,
 }
 
 /**
  * LED LINK: the state push to the Arduino UNO R4 WiFi driving the addressable strip.
  *
- * The browser (Web Serial, Chromium only) sends one byte per state transition over the
- * Arduino's native USB port. `commands` maps each state to that byte; the firmware turns it
- * into a solid strip colour (IDLE red / APPROACH blue / EXIT green).
+ * The browser (Web Serial, Chromium only) sends a two-byte frame over the Arduino's native USB
+ * port on every state transition and, while the player is approaching, whenever the brightness
+ * changes: `[command, brightness]`. `commands` maps each state to the first byte; the firmware
+ * turns it into a solid strip colour (IDLE red / APPROACH cool white / ENTRY blue / EXIT green)
+ * and applies the brightness byte (0 = off, 255 = full).
  */
 export const SERIAL = {
   baudRate: 9600,
   commands: {
     IDLE: 'I',
     APPROACH: 'A',
+    ENTRY: 'N',
     EXIT: 'E',
   },
+}
+
+/**
+ * APPROACH cue: the strip is a cool white that is faint at the far edge of APPROACH and grows
+ * brighter as the player closes the gap to ENTRY. The ramp spans the APPROACH band
+ * (`APPROACH.approachThreshold` → `APPROACH.entryThreshold`).
+ */
+export const LED = {
+  /** Brightness (0–1) for the solid IDLE / ENTRY / EXIT colours (the old global 64/255). */
+  baseBrightness: 64 / 255,
+  /**
+   * Brightness (0–1) at the far edge of APPROACH (the player just stepped within range).
+   *
+   * The ramp tops out at `maxBrightness`, kept deliberately low: cool white is the worst case
+   * for a WS2812 strip, and running it near full pulls enough current that the 5 V rail sags and
+   * the white drifts pink → red as it brightens. Lower `maxBrightness` further if it still
+   * colours, or fix the supply (≥3.6 A, power injection) before raising it.
+   */
+  minBrightness: 0.1,
+  /** Brightness (0–1) at the near edge of APPROACH (about to cross into ENTRY). */
+  maxBrightness: 0.3,
+  /**
+   * Hard ceiling on strip brightness while the player is present (APPROACH / ENTRY), where hand
+   * tracking has to keep working. The APPROACH ramp can otherwise reach full and flood the
+   * webcam's view of the hand; lower this if tracking still drops under the lights.
+   */
+  trackingMaxBrightness: 0.1,
+  /** How often a brightness update may be streamed, in milliseconds (≈20 Hz). */
+  streamIntervalMs: 50,
 }
 
 export const POSE = {
@@ -49,7 +90,7 @@ export const POSE = {
 }
 
 /**
- * APPROACH: the distance-to-camera estimate that drives the IDLE → APPROACH transition.
+ * APPROACH: the distance-to-camera estimate that drives the IDLE → APPROACH → ENTRY ladder.
  *
  * MediaPipe's `worldLandmarks` are hip-origin, so they describe the player's pose in real
  * metres but carry no camera-distance signal — `nose.z` reads near zero however close the
@@ -72,11 +113,20 @@ export const DISTANCE = {
 }
 
 export const APPROACH = {
-  /** Metres from the camera within which the player counts as present at the mirror. */
-  distanceThreshold: 1.2,
   /**
-   * Leave APPROACH only once the distance reads above `distanceThreshold + hysteresis`, so
-   * jitter around the line cannot thrash the state.
+   * The outer edge of APPROACH, in metres. The player enters APPROACH once the distance reads
+   * at or below this, and leaves it again above `approachThreshold + hysteresis`.
+   */
+  approachThreshold: 2,
+  /**
+   * The edge of ENTRY, in metres. Within this the player counts as present at the mirror and
+   * the current ≤1.2 m logic (persona, extend-hand → EXIT) applies. ENTRY is left again above
+   * `entryThreshold + hysteresis`.
+   */
+  entryThreshold: 1.2,
+  /**
+   * Leave a zone only once the distance reads above its threshold + hysteresis, so jitter
+   * around the line cannot thrash the state.
    */
   hysteresis: 0.3,
   /** How long a range change must hold before the state machine acts on it. */
@@ -172,13 +222,15 @@ export const FACE = {
  * therefore built from:
  *   - closeness: apparent hand size, measured across the fingertips only (a reaching hand
  *     loses its palm first, which is why a wrist→MCP reading collapsed);
- *   - foreshortening: the fingertips sit at a clearly different depth from the wrist when the
- *     fingers point at the lens. A flat open palm keeps every landmark at ~one depth whatever
- *     its distance, so this is what separates an extend from an open palm held just as close;
+ *   - foreshortening: each finger's tip sits at a clearly different depth from its knuckle when
+ *     the fingers point at the lens. A flat open palm keeps every landmark at ~one depth
+ *     whatever its distance, so this is what separates an extend from an open palm held just as
+ *     close. The gate is loosened to a per-finger count: a minority of pointing fingers is
+ *     enough, because the per-landmark z is the noisiest output under bright light;
  *   - stillness, then a hold duration.
  *
- * Every gate must hold simultaneously for `holdMs`. The spread and z-spread thresholds are
- * placeholders — calibrate against the live readout, which prints both.
+ * Every gate must hold simultaneously for `holdMs`. The spread threshold is a placeholder —
+ * calibrate against the live readout, which prints it.
  */
 export const EXTEND_HAND = {
   /**
@@ -186,12 +238,15 @@ export const EXTEND_HAND = {
    * out". Measured across the fingertips only, because the palm drops out of frame first when
    * a hand reaches at the mirror-mounted camera.
    */
-  minSpread: 0.45,
+  minSpread: 0.1,
   /**
-   * Minimum depth range across the hand's landmarks, normalised. A flat open palm reads near
-   * zero at any distance; a hand pointing at the camera reads well above it.
+   * Foreshortening gate, loosened: a finger "points at the lens" when its tip→knuckle depth is
+   * greater than `pointingRatio` × its in-plane length. The trigger passes once at least
+   * `minPointingFingers` fingers read as pointing — a minority is enough, so one noisy or
+   * partly occluded finger cannot reject an otherwise valid reach under bright light.
    */
-  minZSpread: 0.22,
+  minPointingFingers: 0,
+  pointingRatio: 1.5,
   /**
    * Max fingertip-centroid travel allowed across the stillness window, as a fraction of the
    * current spread: a close, large hand is allowed proportionally more jitter, so a slightly

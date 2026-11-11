@@ -1,13 +1,13 @@
 import './style.css'
-import { APPROACH, DISTANCE, EXTEND_HAND, GESTURE } from './config.js'
-import { createStateMachine } from './state.js'
+import { APPROACH, DISTANCE, EXTEND_HAND, GESTURE, LED } from './config.js'
+import { createStateMachine, STATE } from './state.js'
 import { startCamera } from './vision/camera.js'
 import {
   createGestureRecognizer,
   FINGERTIPS,
   fingerProfile,
   handSize,
-  handZSpread,
+  pointingFingerCount,
 } from './vision/gesture.js'
 import {
   POSE_LANDMARKS,
@@ -218,10 +218,15 @@ function createFigureControls(persona) {
 
 const machine = createStateMachine()
 
-// Optional LED link to the Arduino. It reads the live state on (re)connect so the strip syncs
-// immediately, and `sendState` is only fired on transitions below. Unavailable browsers/boards
-// degrade to a no-op, so the mirror itself is never blocked by the lights.
-const ledLink = createLedLink({ container: app, getState: () => machine.state })
+// Optional LED link to the Arduino. It reads the live state + brightness on (re)connect so the
+// strip syncs immediately, and `sendLed` is called every frame (throttled internally in
+// firmware.js) so the APPROACH ramp stays smooth. Unavailable browsers/boards degrade to a
+// no-op, so the mirror itself is never blocked by the lights.
+let ledBrightness = LED.baseBrightness
+const ledLink = createLedLink({
+  container: app,
+  getLed: () => ({ state: machine.state, brightness: ledBrightness }),
+})
 
 // Scene first: the renderer owns the black canvas, and the persona is added before any model
 // loads so the mirror is already black (not an empty page) while booting.
@@ -253,6 +258,7 @@ let lastExtendHandAt = -Infinity
 let extendHandCount = 0
 let stateChangedAt = performance.now()
 let lastTransition = '—'
+let lastProximity = 0
 
 const format = (landmark) =>
   landmark
@@ -287,15 +293,14 @@ function tick() {
 
   const handLandmarks = hand.landmarks?.[0]
   const spread = handSize(handLandmarks)
-  const zSpread = handZSpread(handLandmarks)
   const tips = handLandmarks ? FINGERTIPS.filter((index) => handLandmarks[index]).length : 0
+  const handConfidence = hand.handedness?.[0]?.[0]?.score ?? 0
 
-  // Diagnostics only — the trigger does not read any of this. A finger reads as "pointing at
-  // the lens" when it has travelled further in depth than in the image plane.
+  // Per-finger foreshortening: a finger reads as "pointing at the lens" when it has travelled
+  // further in depth than in the image plane. The detector now gates on this count, so the
+  // readout mirrors the trigger rather than being diagnostics only.
   const fingers = fingerProfile(handLandmarks)
-  const pointing = fingers.filter(
-    (finger) => finger.depth != null && finger.depth > 1.5 * finger.inPlane,
-  ).length
+  const pointing = pointingFingerCount(handLandmarks)
   const fingerLine = handLandmarks
     ? fingers
         .map((finger) =>
@@ -317,14 +322,34 @@ function tick() {
   if (state !== previousState) {
     stateChangedAt = timestamp
     lastTransition = events.join(', ')
-    ledLink.sendState(state)
   }
+
+  // Proximity: 0 at the far edge of APPROACH, 1 at the edge of ENTRY. It drives both the
+  // persona's distance fade-in and the LED's cool-white brightness ramp, so the screen and the
+  // strip brighten together as the player closes the gap. Hold the last value through a dropped
+  // pose frame so a single missing reading cannot make the figure blink out.
+  if (distance != null) {
+    const band = APPROACH.approachThreshold - APPROACH.entryThreshold
+    const raw = (APPROACH.approachThreshold - distance) / band
+    lastProximity = Math.max(0, Math.min(1, raw))
+  }
+  const proximity = lastProximity
+
+  // Cap the strip while the player is present (APPROACH / ENTRY) so the light cannot flood the
+  // webcam's view of the hand; the exposure lock in camera.js is the primary fix.
+  const capBrightness = (value) => Math.min(value, LED.trackingMaxBrightness)
+  ledBrightness =
+    state === STATE.APPROACH
+      ? capBrightness(LED.minBrightness + proximity * (LED.maxBrightness - LED.minBrightness))
+      : capBrightness(LED.baseBrightness)
+  ledLink.sendLed({ state, brightness: ledBrightness })
 
   const personaFrame = persona.update({
     landmarks,
     faceLandmarks,
     handLandmarks: hand.landmarks,
     state,
+    proximity,
     dt,
   })
   renderer.render()
@@ -336,7 +361,7 @@ function tick() {
       : 'no person'
   // Hold at the true threshold and this is the focalFactor that makes the reading match it.
   const calibrateLine = span
-    ? `${(APPROACH.distanceThreshold / (span.real / span.apparent)).toFixed(2)} if you stand at ${APPROACH.distanceThreshold} m`
+    ? `${(APPROACH.entryThreshold / (span.real / span.apparent)).toFixed(2)} if you stand at ${APPROACH.entryThreshold} m`
     : '—'
 
   const faceStatus = personaFrame?.face
@@ -374,8 +399,8 @@ function tick() {
     `faceDust  ${faceLine}`,
     `handDust  ${handsLine}`,
     `hand      ${handLandmarks ? `spread ${spread.toFixed(3)} (${tips} tips) / needs ${EXTEND_HAND.minSpread}` : 'none'}`,
-    `depth     ${handLandmarks ? `z-spread ${zSpread.toFixed(3)} / needs ${EXTEND_HAND.minZSpread}` : '—'}`,
-    `fingers   ${fingerLine}${handLandmarks ? `  → pointing ${pointing}/4` : ''}`,
+    `handConf  ${handLandmarks ? handConfidence.toFixed(2) : '—'}`,
+    `fingers   ${fingerLine}${handLandmarks ? `  → pointing ${pointing}/${fingers.length} / needs ${EXTEND_HAND.minPointingFingers}` : ''}`,
     `trigger   ${timestamp - lastExtendHandAt < 500 ? `EXTEND_HAND (${extendHandCount})` : '—'}`,
   ].join('\n')
 }

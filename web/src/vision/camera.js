@@ -1,6 +1,34 @@
 import { CAMERA } from '../config.js'
 
 /**
+ * Lock the video track's exposure to the value the camera chose under the current ambient light,
+ * so the LED strip lighting up cannot make the auto-exposure swing and wash out the hand mid
+ * reach. Chromium exposes this through the track's capabilities; webcams without manual exposure
+ * silently keep their auto settings, so the mirror is never blocked by a failed lock.
+ *
+ * @param {MediaStreamTrack | undefined} track
+ */
+async function lockExposure(track) {
+  const capabilities = track?.getCapabilities?.()
+  if (!capabilities?.exposureMode?.includes('manual')) return
+
+  const range = capabilities.exposureTime
+  const desired = CAMERA.exposureTime ?? track.getSettings?.().exposureTime
+  const exposureTime = range
+    ? Math.min(range.max, Math.max(range.min, desired ?? (range.min + range.max) / 2))
+    : desired
+
+  try {
+    await track.applyConstraints({
+      advanced: [{ exposureMode: 'manual', ...(exposureTime != null ? { exposureTime } : {}) }],
+    })
+    if (range) console.info('Camera exposure locked', { exposureTime, range })
+  } catch (error) {
+    console.warn('Camera exposure lock failed; auto-exposure stays on.', error)
+  }
+}
+
+/**
  * Requests the USB webcam and returns a playing, hidden <video> ready to feed the
  * MediaPipe landmarkers.
  *
@@ -30,6 +58,10 @@ export async function startCamera() {
     },
     audio: false,
   })
+
+  // Lock exposure before the LED ramp can brighten the scene, so the reading the camera settled
+  // on under ambient light is the one it keeps while the player is at the mirror.
+  if (CAMERA.lockExposure) await lockExposure(stream.getVideoTracks()[0])
 
   const ready = new Promise((resolve, reject) => {
     video.addEventListener('loadeddata', resolve, { once: true })

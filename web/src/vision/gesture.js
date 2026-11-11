@@ -46,10 +46,10 @@ export function fingertipCentroid(landmarks) {
 /**
  * Depth range across the hand's landmarks: `max(z) - min(z)`.
  *
- * This is what tells the two "wide hand" poses apart, and it is distance-independent. A hand
- * pointing at the camera is foreshortened — the fingertips sit at a clearly different depth
- * from the wrist — whereas a flat open palm keeps every landmark at roughly one depth however
- * close it is held. So an open palm held as close as an extend still reads near zero here.
+ * Retained as a coarse diagnostic: it is distance-independent, and a hand pointing at the
+ * camera reads higher than a flat open palm. The trigger no longer gates on this global value —
+ * it counts foreshortened fingers instead (see `pointingFingerCount`) — because a single noisy
+ * landmark can swing the whole range, which is exactly what happens under bright light.
  */
 export function handZSpread(landmarks) {
   const zs = (landmarks ?? [])
@@ -60,12 +60,15 @@ export function handZSpread(landmarks) {
 }
 
 /**
- * The four non-thumb fingers, as MCP (knuckle) and tip landmark indices.
+ * The five fingers, as MCP (knuckle) and tip landmark indices.
  *
- * The thumb is excluded: it is not a "pointing" finger, and its landmarks are the least
- * stable of the five.
+ * The thumb is included as a pointing candidate so a reach can register when only a couple of
+ * fingers point at the lens. Its landmarks are the least stable of the five, but the per-finger
+ * test below ignores it unless its depth clearly dominates its in-plane length, so it cannot
+ * pass the gate on its own.
  */
 export const FINGERS = [
+  { label: 'T', mcp: 2, tip: 4 }, // thumb
   { label: 'I', mcp: 5, tip: 8 }, // index
   { label: 'M', mcp: 9, tip: 12 }, // middle
   { label: 'R', mcp: 13, tip: 16 }, // ring
@@ -73,15 +76,15 @@ export const FINGERS = [
 ]
 
 /**
- * Per-finger foreshortening profile, for diagnosing the poses that currently false-positive.
+ * Per-finger foreshortening profile, used by the pointing gate and the live readout.
  *
  * Each finger is measured against *its own* knuckle rather than against the other fingertips:
  *   - `inPlane` — tip→MCP distance in the image plane;
  *   - `depth` — tip→MCP distance along z.
  *
- * A finger pointing at the lens is foreshortened: small `inPlane`, large `depth`. An open palm
- * is the opposite (large `inPlane`, small `depth`), and a curled finger (fist) is small on both
- * — which is why neither the spread nor the z-spread gate can tell them apart.
+ * A finger pointing at the lens is foreshortened: large `depth` relative to `inPlane`. An open
+ * palm is the opposite (large `inPlane`, small `depth`), and a curled finger (fist) is small on
+ * both — which is why a fist is rejected by the fingertip spread gate rather than by this one.
  */
 export function fingerProfile(landmarks) {
   return FINGERS.map(({ label, mcp, tip }) => {
@@ -95,6 +98,23 @@ export function fingerProfile(landmarks) {
       depth: Math.abs(fingertip.z - knuckle.z),
     }
   })
+}
+
+/**
+ * How many fingers read as pointing at the lens.
+ *
+ * A finger is foreshortened when its depth travel (tip→knuckle along z) exceeds
+ * `pointingRatio` × its in-plane length. Counting fingers, rather than requiring one global
+ * z-spread, lets the trigger need only a minority to agree — which keeps it working when the
+ * per-landmark z is biased by bright light or a hand is partly occluded.
+ */
+export function pointingFingerCount(landmarks) {
+  return fingerProfile(landmarks).filter(
+    (finger) =>
+      finger.inPlane != null &&
+      finger.depth != null &&
+      finger.depth > EXTEND_HAND.pointingRatio * finger.inPlane,
+  ).length
 }
 
 /**
@@ -161,9 +181,10 @@ export function createExtendHandDetector() {
       return false
     }
 
-    // A flat open palm is just as wide and can be held just as close; only the depth range
-    // separates it from a hand whose fingers point at the camera.
-    if (handZSpread(hand) < EXTEND_HAND.minZSpread) {
+    // A flat open palm is just as wide and can be held just as close, so require the hand to be
+    // foreshortened. Counting pointing fingers (rather than a single global z-spread) keeps this
+    // working under bright light, where the per-landmark z is noisy: a minority is enough.
+    if (pointingFingerCount(hand) < EXTEND_HAND.minPointingFingers) {
       reset()
       return false
     }

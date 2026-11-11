@@ -5,8 +5,9 @@ An interactive, automated "Magic Mirror" escape room prop
 * **System Architecture:** The app runs externally on my laptop (external processing power). The screen background is pure black (#000000) so bright white/neon Three.js visuals drown out reflections while black areas act as a physical mirror.
 * **Core Interaction Loop:** 
   1. IDLE: Mirror mode (black display). Continuous distance tracking via MediaPipe Pose.
-  2. APPROACH: Player steps within 1.5m -> Persona materializes in Three.js and tracks player's gaze/head motion.
-  3. EXIT TRIGGER: Player extends a hand toward the mirror (fingers pointing at the camera) and holds it still, detected from hand landmarks via MediaPipe -> Triggers a glass-break visual, Nietzsche quote, and voiceover audio.
+  2. APPROACH: Player steps within 2.0m -> the persona fades in as they close the gap, and the LED strip glows a faint cool white that brightens with proximity.
+  3. ENTRY: Player reaches within 1.2m -> the persona fully materialises and tracks the player's gaze/head motion; the strip turns blue.
+  4. EXIT TRIGGER: Player extends a hand toward the mirror (fingers pointing at the camera) and holds it still, detected from hand landmarks via MediaPipe -> Triggers a glass-break visual, Nietzsche quote, and voiceover audio.
 
 ## Dependencies
 - three.js
@@ -35,8 +36,8 @@ alter-ego/
 ├── src/
 │   ├── main.js                 # entry: bootstraps the app, wires modules together
 │   ├── style.css               # global styles (black page, fullscreen canvas)
-│   ├── config.js               # tunables: 1.5m threshold, model paths, timings
-│   ├── state.js                # IDLE → APPROACH → EXIT TRIGGER state machine
+│   ├── config.js               # tunables: 1.2m/2.0m thresholds, model paths, timings
+│   ├── state.js                # IDLE → APPROACH → ENTRY → EXIT TRIGGER state machine
 │   ├── vision/
 │   │   ├── camera.js           # getUserMedia setup + video element
 │   │   ├── fileset.js          # shared tasks-vision WASM runtime, loaded once
@@ -60,11 +61,18 @@ Notes:
 - Model and WASM paths are absolute (`/models/...`, `/wasm`) because Vite serves `public/`
   at the web root; keep the vendored copies so the prop runs offline.
 - `state.js` is the spine of the Core Interaction Loop — it reads `vision/` readings each frame
-  and returns edge events (`enterApproach`, `enterExit`, `enterIdle`) that `scene/` and
-  `audio/` will hang off. It is pure (no DOM, no MediaPipe, no Three.js), which is what lets
+  and returns edge events (`enterApproach`, `enterEntry`, `enterExit`, `enterIdle`) that `scene/`
+  and `audio/` will hang off. It is pure (no DOM, no MediaPipe, no Three.js), which is what lets
   `dev/stateHarness.js` verify it without a camera.
 - `scene/persona.js` maps normalised landmarks onto an orthographic frame (flipped horizontally
-  to line up with the mirror) and exists only outside IDLE: a shoulder→hip dust cloud forms the
-  torso silhouette, and a drifting face-dust cloud is carved around the eyes, nose and mouth in
-  front of it. All colours, opacity, drift and ramp timings live in `PERSONA` in `config.js`.
+  to line up with the mirror) and fades in across APPROACH, fully present outside IDLE: a
+  shoulder→hip dust cloud forms the torso silhouette, and a drifting face-dust cloud is carved
+  around the eyes, nose and mouth in front of it. All colours, opacity, drift and ramp timings
+  live in `PERSONA` in `config.js`.
+- The extend-hand trigger needs only a minority of fingers (≥ `EXTEND_HAND.minPointingFingers`)
+  to read as foreshortened, not a large global z-spread, because the per-landmark z is the
+  noisiest MediaPipe output under bright light. Camera exposure is locked at boot
+  (`CAMERA.lockExposure`) and the strip is capped during tracking (`LED.trackingMaxBrightness`)
+  so bright LEDs cannot wash out the hand. If tracking still drops, lower the cap and re-tune
+  `CAMERA.exposureTime` using the range logged to the console at boot.
 - Keep the page background pure black (`#000000`); no HTML chrome around the canvas.
