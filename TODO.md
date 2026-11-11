@@ -16,13 +16,13 @@
   - [x] Measure holes
 - [x] Apply mirror film
 - [x] Cut foam board
-- [ ] Align components and assemble
-- [ ] Refine distance tracking & triggers
+- [x] Align components and assemble
+- [x] Refine distance tracking & triggers
 - [ ] Add story
   - [ ] Narration
   - [ ] Text
   - [ ] Music & sound effects
-- [ ] Add lights
+- [x] Add lights
 - [x] Three.js persona
   - [x] Fine tune face parameters
   - [x] Tune head parameters
