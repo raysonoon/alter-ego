@@ -1,4 +1,4 @@
-import { CAMERA } from '../config.js'
+import { CAMERA, DEBUG } from '../config.js'
 
 /**
  * Lock the video track's exposure to the value the camera chose under the current ambient light,
@@ -48,7 +48,7 @@ export async function startCamera() {
   video.muted = true
   video.autoplay = true
   video.setAttribute('aria-hidden', 'true')
-  video.className = CAMERA.preview ? 'camera-feed camera-feed--preview' : 'camera-feed'
+  video.className = DEBUG.preview ? 'camera-feed camera-feed--preview' : 'camera-feed'
 
   const stream = await navigator.mediaDevices.getUserMedia({
     video: {

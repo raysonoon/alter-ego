@@ -32,7 +32,7 @@ body {
   display: none;
 }
 
-/* Debug-only live preview, toggled by CAMERA.preview. Raw (unmirrored) so it lines up
+/* Debug-only live preview, toggled by DEBUG.preview. Raw (unmirrored) so it lines up
    with landmark coordinates. */
 .camera-feed--preview {
   display: block;
@@ -145,4 +145,72 @@ body {
 .debug-row output {
   text-align: right;
   color: #cfd8ff;
+}
+
+/* Story text: narration prompt, the abyss quote, and the ALTER EGO title. Pure overlay — no chrome,
+   no background; it sits above the canvas but below the debug panels so tuning stays readable. */
+.story {
+  position: fixed;
+  inset: 0;
+  z-index: 5;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+.story-line {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: min(88vw, 1200px);
+  transform: translate(-50%, -50%);
+  text-align: center;
+  font: 600 clamp(1.5rem, 3.2vw, 3rem) / 1.28 ui-sans-serif, system-ui, 'Segoe UI', sans-serif;
+  letter-spacing: 0.03em;
+  color: #dff0ff;
+  opacity: 0;
+  text-shadow: 0 0 18px rgba(120, 190, 255, 0.5), 0 0 48px rgba(70, 130, 255, 0.3);
+  will-change: opacity;
+}
+
+.story-line--primary {
+  margin-top: -2.2rem;
+}
+
+.story-line--secondary {
+  margin-top: 2.2rem;
+}
+
+/* The step-4 instruction sits lower so it never covers the persona's face. */
+.story-line--prompt {
+  top: 76%;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  animation: story-prompt-glow 2.8s ease-in-out infinite;
+}
+
+@keyframes story-prompt-glow {
+  0%,
+  100% {
+    text-shadow: 0 0 16px rgba(120, 195, 255, 0.4), 0 0 40px rgba(70, 130, 255, 0.22);
+  }
+  50% {
+    text-shadow: 0 0 26px rgba(150, 210, 255, 0.75), 0 0 70px rgba(90, 150, 255, 0.45);
+  }
+}
+
+.story-title {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(94vw, 1400px);
+  text-align: center;
+  font: 700 clamp(2.8rem, 9vw, 8rem) / 1.05 ui-sans-serif, system-ui, 'Segoe UI', sans-serif;
+  letter-spacing: 0.26em;
+  text-indent: 0.26em;
+  color: #eef7ff;
+  opacity: 0;
+  text-shadow: 0 0 24px rgba(150, 205, 255, 0.6), 0 0 70px rgba(80, 140, 255, 0.45),
+    0 0 120px rgba(40, 90, 255, 0.3);
+  will-change: opacity;
 }

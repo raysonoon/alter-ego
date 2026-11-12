@@ -1,5 +1,5 @@
 import './style.css'
-import { APPROACH, DISTANCE, EXTEND_HAND, GESTURE, LED } from './config.js'
+import { APPROACH, DEBUG, DISTANCE, EXTEND_HAND, GESTURE, GLASS, LED, STORY } from './config.js'
 import { createStateMachine, STATE } from './state.js'
 import { startCamera } from './vision/camera.js'
 import {
@@ -18,17 +18,25 @@ import {
 import { createFaceLandmarker, FACE_REGIONS, FACE_TRIANGLES } from './vision/face.js'
 import { createRenderer } from './scene/renderer.js'
 import { createPersona } from './scene/persona.js'
+import { createTextOverlay } from './scene/textOverlay.js'
+import { createGlassBreak } from './scene/effects/glassBreak.js'
+import { createAudioEngine } from './audio/engine.js'
+import { createDirector } from './audio/director.js'
+import { AUDIO_ASSETS } from './audio/assets.js'
 import { createLedLink } from './firmware.js'
 
 const app = document.querySelector('#app')
 
-// Temporary vision readout, drawn over the scene while the loop is calibrated. Strip this and
-// the `#debug` styles once the prop is tuned.
-const readout = document.createElement('pre')
-readout.id = 'debug'
-readout.className = 'debug'
-readout.textContent = 'booting…'
-app.appendChild(readout)
+// Temporary vision readout, drawn over the scene while the loop is calibrated. Toggled by
+// DEBUG.readout in config.js; strip this and the `#debug` styles once the prop is tuned.
+let readout = null
+if (DEBUG.readout) {
+  readout = document.createElement('pre')
+  readout.id = 'debug'
+  readout.className = 'debug'
+  readout.textContent = 'booting…'
+  app.appendChild(readout)
+}
 
 // The state machine is pure, so it is verified against scripted input timelines with no camera
 // at all. DEV-only, so it is stripped from the production build.
@@ -241,11 +249,36 @@ const persona = createPersona({
   pixelRatio: renderer.renderer.getPixelRatio(),
 })
 renderer.scene.add(persona.group)
-createFaceControls(persona)
-createTorsoControls(persona)
-createHandControls(persona)
-createHeadControls(persona)
-createFigureControls(persona)
+if (DEBUG.sliders) {
+  createFaceControls(persona)
+  createTorsoControls(persona)
+  createHandControls(persona)
+  createHeadControls(persona)
+  createFigureControls(persona)
+}
+
+// Story layer: audio buses + the narration sequence, the on-screen text, and the glass-crack
+// effect. The director reacts only to the state machine's edge events (see audio/director.js).
+const audio = createAudioEngine({ assets: AUDIO_ASSETS })
+const text = createTextOverlay({ container: app })
+const glass = createGlassBreak({ scene: renderer.scene, view: renderer.view, config: GLASS })
+const director = createDirector({ audio, text, glass, config: STORY })
+
+// The AudioContext starts suspended until a user gesture (autoplay policy). The camera-permission
+// click or the LED connect button satisfies this in practice; keep listening until a gesture
+// actually unlocks it, then stop (and the engine replays any clip that was silenced meanwhile).
+const unlockAudio = async () => {
+  const unlocked = await audio.unlock()
+  if (unlocked) {
+    window.removeEventListener('pointerdown', unlockAudio)
+    window.removeEventListener('keydown', unlockAudio)
+  }
+}
+window.addEventListener('pointerdown', unlockAudio)
+window.addEventListener('keydown', unlockAudio)
+
+/** Fed to the extend-hand detector while the trigger is disabled, so it stays armed. */
+const NO_HAND = { landmarks: [], handedness: [] }
 
 let camera
 let pose
@@ -311,7 +344,11 @@ function tick() {
         .join('  ')
     : '—'
 
-  const extendHand = gesture.detectExtendHand(hand, timestamp)
+  // The extend-hand EXIT trigger is armed only on the prompt step, so a stray reach during the
+  // earlier narration cannot cut the story short. While disabled we feed the detector empty
+  // results: that keeps it re-armed for the next run instead of leaving a stale trigger latched.
+  const triggerEnabled = machine.state === STATE.ENTRY && director.step === STORY.triggerStep
+  const extendHand = gesture.detectExtendHand(triggerEnabled ? hand : NO_HAND, timestamp)
   if (extendHand) {
     lastExtendHandAt = timestamp
     extendHandCount += 1
@@ -323,6 +360,9 @@ function tick() {
     stateChangedAt = timestamp
     lastTransition = events.join(', ')
   }
+
+  // Drive the story from the machine's state + edge events (audio, text, glass, lip-sync).
+  director.update({ state, events, timestamp })
 
   // Proximity: 0 at the far edge of APPROACH, 1 at the edge of ENTRY. It drives both the
   // persona's distance fade-in and the LED's cool-white brightness ramp, so the screen and the
@@ -351,8 +391,14 @@ function tick() {
     state,
     proximity,
     dt,
+    mouth: { open: director.mouthOpen },
+    shattered: director.shattered,
   })
+  glass.update(timestamp)
   renderer.render()
+
+  // Debug readout (DEBUG.readout): skip all the per-frame formatting when it is disabled.
+  if (!readout) return
 
   const distanceLine = distance != null
     ? `${distance.toFixed(2)} m  [apparent ${span.apparent.toFixed(3)} / real ${span.real.toFixed(3)}]`
@@ -401,7 +447,8 @@ function tick() {
     `hand      ${handLandmarks ? `spread ${spread.toFixed(3)} (${tips} tips) / needs ${EXTEND_HAND.minSpread}` : 'none'}`,
     `handConf  ${handLandmarks ? handConfidence.toFixed(2) : '—'}`,
     `fingers   ${fingerLine}${handLandmarks ? `  → pointing ${pointing}/${fingers.length} / needs ${EXTEND_HAND.minPointingFingers}` : ''}`,
-    `trigger   ${timestamp - lastExtendHandAt < 500 ? `EXTEND_HAND (${extendHandCount})` : '—'}`,
+    `story     step ${director.step}  ${director.runningAway ? 'running away' : 'present'}  mouth ${director.mouthOpen.toFixed(2)}`,
+    `trigger   ${timestamp - lastExtendHandAt < 500 ? `EXTEND_HAND (${extendHandCount})` : triggerEnabled ? `armed (step ${STORY.triggerStep})` : 'disabled'}`,
   ].join('\n')
 }
 
@@ -455,6 +502,12 @@ if (import.meta.hot) {
     gesture?.close()
     face?.close()
     camera?.stop()
+    window.removeEventListener('pointerdown', unlockAudio)
+    window.removeEventListener('keydown', unlockAudio)
+    director.reset()
+    audio.dispose()
+    text.dispose()
+    glass.dispose()
     persona.dispose()
     renderer.dispose()
     ledLink.dispose()

@@ -66,6 +66,7 @@ export const HAND_DEFAULTS = {
   handFlickerSpeed: HAND.flickerSpeed,
   handStream: HAND.stream,
   handMinSpan: HAND.minSpan,
+  handSmoothMs: HAND.smoothMs,
 }
 
 /**
@@ -830,8 +831,12 @@ function convexHull(points) {
 /**
  * Build the carve polygons in world space from the live landmarks. A region with a missing or
  * non-finite vertex is skipped, so one bad landmark cannot blank the whole face.
+ *
+ * `mouth` (optional) modulates the lips polygon around its centre for lip-sync: the mouth is a
+ * void carved out of the dust, so widening the polygon reads as the jaw opening. Loudness feeds
+ * `open` today; `wide`/`round` are reserved for a future authored viseme track.
  */
-function buildCarveRegions(regions, worldX, worldY) {
+function buildCarveRegions(regions, worldX, worldY, mouth) {
   const polygons = []
 
   for (const region of regions) {
@@ -850,6 +855,30 @@ function buildCarveRegions(regions, worldX, worldY) {
 
     const polygon = region.hull ? convexHull(points) : points.flatMap((p) => p)
     if (polygon.length < 6) continue
+
+    if (region.name === 'lips' && mouth) {
+      const open = Math.min(1, Math.max(0, mouth.open ?? 0))
+      const wide = Math.min(1, Math.max(0, mouth.wide ?? 0))
+      const round = Math.min(1, Math.max(0, mouth.round ?? 0))
+      if (open > 0 || wide > 0 || round > 0) {
+        const vertexCount = polygon.length / 2
+        let cx = 0
+        let cy = 0
+        for (let i = 0; i < polygon.length; i += 2) {
+          cx += polygon[i]
+          cy += polygon[i + 1]
+        }
+        cx /= vertexCount
+        cy /= vertexCount
+
+        const sx = 1 + wide * 0.35 + round * 0.12 + open * 0.1
+        const sy = 1 + open * 1.1 + round * 0.3
+        for (let i = 0; i < polygon.length; i += 2) {
+          polygon[i] = cx + (polygon[i] - cx) * sx
+          polygon[i + 1] = cy + (polygon[i + 1] - cy) * sy
+        }
+      }
+    }
 
     let minX = Infinity
     let maxX = -Infinity
@@ -1023,7 +1052,7 @@ function updateHeadDust(faceStatus, headDust, depth) {
  * Everything happens on the CPU so the carve tests the exact position that gets rendered. Returns
  * the face bounds so the head halo can follow it.
  */
-function updateFaceDust(faceLandmarks, faceDust, regions, frame, depth, time, spec) {
+function updateFaceDust(faceLandmarks, faceDust, regions, frame, depth, time, spec, mouth) {
   const { points, geometry, count, layout } = faceDust
 
   if (!count) {
@@ -1062,7 +1091,7 @@ function updateFaceDust(faceLandmarks, faceDust, regions, frame, depth, time, sp
     worldY[i] = (0.5 - landmark.y) * sy
   }
 
-  const polygons = buildCarveRegions(regions, worldX, worldY)
+  const polygons = buildCarveRegions(regions, worldX, worldY, mouth)
   const softness = spec.faceCarveSoftness
   const drift = spec.faceDustDrift
   const rise = spec.faceDustRise
@@ -1187,6 +1216,47 @@ function handBounds(handLandmarks, frame) {
   }
 }
 
+/** True when a per-hand landmark array contains at least one non-empty hand. */
+function hasHands(handLandmarks) {
+  return (
+    Array.isArray(handLandmarks) &&
+    handLandmarks.some((hand) => Array.isArray(hand) && hand.length > 0)
+  )
+}
+
+/**
+ * Temporally smooth a hand's world-space bounding box with an exponential moving average.
+ *
+ * MediaPipe's per-frame landmarks jitter by a few pixels even when the hand is held still, so an
+ * unsmoothed box makes the dust cloud shiver — which reads as flicker even while the hand is
+ * tracked. Smoothing the centre and size separately keeps the cloud stable while still following
+ * a moving hand. `dt` is the frame step and `tau` the EMA time constant, both in seconds.
+ */
+function smoothHandBox(unit, raw, dt, tau) {
+  if (!Number.isFinite(tau) || tau <= 0 || !Number.isFinite(dt) || dt <= 0) {
+    unit.smoothedBox = { ...raw }
+    return raw
+  }
+
+  const prev = unit.smoothedBox
+  if (!prev) {
+    unit.smoothedBox = { ...raw }
+    return raw
+  }
+
+  const alpha = 1 - Math.exp(-dt / tau)
+  const box = {
+    x: prev.x + (raw.x - prev.x) * alpha,
+    y: prev.y + (raw.y - prev.y) * alpha,
+    width: prev.width + (raw.width - prev.width) * alpha,
+    height: prev.height + (raw.height - prev.height) * alpha,
+    written: raw.written,
+  }
+  box.radius = Math.max(box.width, box.height) / 2
+  unit.smoothedBox = box
+  return box
+}
+
 /**
  * Point one dust capsule from `from` to `to`, tapering its radius from `fromThick` to `toThick`.
  *
@@ -1242,7 +1312,7 @@ function updateHandCap(handBox, handCap, spec) {
  * shoulder the other hand picks the remaining one, which keeps the two arms from collapsing
  * onto the same side of the body.
  */
-function updateHands(landmarks, handLandmarks, handUnits, frame, spec) {
+function updateHands(landmarks, handLandmarks, handUnits, frame, spec, dt = 0) {
   const statuses = handUnits.map(() => ({ visible: false, reason: 'no-hand', cap: false }))
   if (!handUnits.length) return statuses
 
@@ -1268,13 +1338,19 @@ function updateHands(landmarks, handLandmarks, handUnits, frame, spec) {
   for (let i = 0; i < handUnits.length; i += 1) {
     const unit = handUnits[i]
     const hand = handLandmarks?.[i]
-    if (!hand) continue
+    if (!hand) {
+      // The hand is gone for good (the caller's grace hold has expired): drop any smoothed box
+      // so the next appearance starts clean instead of easing in from a stale position.
+      unit.smoothedBox = null
+      continue
+    }
 
-    const box = handBounds(hand, frame)
-    if (!box) {
+    const rawBox = handBounds(hand, frame)
+    if (!rawBox) {
       statuses[i] = { visible: false, reason: 'no-hand-bounds', cap: false }
       continue
     }
+    const box = smoothHandBox(unit, rawBox, dt, (spec.handSmoothMs ?? 0) / 1000)
 
     // Nearest unclaimed shoulder; fall back to the nearest overall if both are already taken.
     let best = -1
@@ -1472,6 +1548,15 @@ export function createPersona({
 
   let opacity = 0
   let time = 0
+  // Set by the glass-shatter beat: stop reading the camera and let the frozen figure fade out
+  // fast. Cleared once the story resets for the next player.
+  let dismissed = false
+
+  // Last-good hand landmarks + the time they were seen. Hand tracking drops for a few frames at
+  // a time; holding the last reading across a short grace window stops the dust blinking off on
+  // every dropped frame (see `handGraceMs`).
+  let lastHandLandmarks = null
+  let lastHandSeenAt = -Infinity
 
   /** Runs immediately before `main.js` calls `view.render()` for this frame. */
   function debugCheckGeometry() {
@@ -1501,17 +1586,54 @@ export function createPersona({
    * @param {string} frame.state current IDLE / APPROACH / ENTRY / EXIT state
    * @param {number} [frame.proximity] 0–1 distance factor within APPROACH (0 far, 1 at ENTRY)
    * @param {number} [frame.dt] seconds since the previous frame
+   * @param {{ open?: number, wide?: number, round?: number }} [frame.mouth] lip-sync shape, where
+   *   `open` (0–1) is the jaw opening driven by narration loudness
+   * @param {boolean} [frame.shattered] true from the glass-shatter beat onwards: stop tracking
+   *   and dismiss the figure quickly
    */
-  function update({ landmarks, faceLandmarks, handLandmarks, state, proximity = 1, dt = 0 } = {}) {
+  function update({
+    landmarks,
+    faceLandmarks,
+    handLandmarks,
+    state,
+    proximity = 1,
+    dt = 0,
+    mouth = null,
+    shattered = false,
+  } = {}) {
     const step = Math.min(Math.max(dt, 0), 0.25)
     time += step
 
+    if (shattered) {
+      dismissed = true
+    } else if (state === 'IDLE') {
+      dismissed = false
+      // A new player must not inherit a hand held over from the previous run.
+      lastHandLandmarks = null
+      lastHandSeenAt = -Infinity
+    }
+
     // The figure exists only at the mirror; IDLE is the black mirror itself. In APPROACH it
-    // fades in with proximity, so it materialises as the player closes the gap to ENTRY.
-    const active =
-      state === 'IDLE' ? 0 : state === 'APPROACH' ? Math.max(0, Math.min(1, proximity)) : 1
-    const tau = active > opacity ? spec.appearTau : spec.disappearTau
-    opacity += (active - opacity) * (1 - Math.exp(-step / tau))
+    // fades in with proximity, so it materialises as the player closes the gap to ENTRY. Once
+    // the glass shatters it is dismissed outright: the camera may still report the player, but
+    // the persona no longer follows them.
+    const active = dismissed
+      ? 0
+      : state === 'IDLE'
+        ? 0
+        : state === 'APPROACH'
+          ? Math.max(0, Math.min(1, proximity))
+          : 1
+
+    if (dismissed) {
+      // Linear and finite: the suction beat must clear the figure completely, not leave a
+      // lingering asymptotic ghost.
+      const fade = spec.shatterFade ?? 0.12
+      opacity = fade > 0 ? Math.max(0, opacity - step / fade) : 0
+    } else {
+      const tau = active > opacity ? spec.appearTau : spec.disappearTau
+      opacity += (active - opacity) * (1 - Math.exp(-step / tau))
+    }
     if (opacity < 0.002) opacity = 0
     if (opacity > 0.998) opacity = 1
 
@@ -1597,14 +1719,40 @@ export function createPersona({
     faceDust.uniforms.uColor.value.set(faceSpec.faceColor)
 
     if (!root.visible) {
-      const hidden = { visible: false, reason: 'persona-hidden' }
+      const reason = dismissed ? 'shattered' : 'persona-hidden'
+      const hidden = { visible: false, reason }
       return {
         visible: false,
         opacity,
         face: hidden,
-        hands: handUnits.map(() => ({ visible: false, reason: 'persona-hidden', cap: false })),
+        hands: handUnits.map(() => ({ visible: false, reason, cap: false })),
       }
     }
+
+    // The shatter beat freezes the persona as-is: no more landmark reads, just the existing dust
+    // fading out. This keeps it from chasing the player through the glass-break reveal.
+    if (dismissed) {
+      const hidden = { visible: false, reason: 'shattered' }
+      return {
+        visible: root.visible,
+        opacity,
+        face: hidden,
+        hands: handUnits.map(() => ({ visible: false, reason: 'shattered', cap: false })),
+      }
+    }
+
+    // Hold the last-good hand landmarks across a short grace window so a dropped MediaPipe frame
+    // does not blink the dust off. The dismissed freeze above returns before this, and IDLE
+    // clears the hold, so a genuinely-removed hand still fades out.
+    if (hasHands(handLandmarks)) {
+      lastHandLandmarks = handLandmarks
+      lastHandSeenAt = time
+    }
+    const grace = (spec.handGraceMs ?? 0) / 1000
+    const heldHandLandmarks =
+      hasHands(handLandmarks) || time - lastHandSeenAt > grace
+        ? handLandmarks
+        : lastHandLandmarks
 
     if (landmarks) updateTorso(landmarks, frame, torso, dust.uniforms)
 
@@ -1616,10 +1764,11 @@ export function createPersona({
       faceSpec.faceDepth,
       time,
       faceSpec,
+      mouth,
     )
 
     updateHeadDust(faceStatus, headDust, faceSpec.faceDepth)
-    const hands = updateHands(landmarks, handLandmarks, handUnits, frame, handSpec)
+    const hands = updateHands(landmarks, heldHandLandmarks, handUnits, frame, handSpec, step)
 
     debugCheckGeometry()
 

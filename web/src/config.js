@@ -21,8 +21,6 @@ export const CAMERA = {
   width: 1280,
   height: 720,
   facingMode: 'user',
-  /** Debug aid: render the live feed as a corner thumbnail. Off in the final prop. */
-  preview: true,
   /**
    * Lock the camera's exposure so bright LED light cannot make the webcam's auto-exposure swing
    * and wash out the hand mid-reach. Chromium exposes manual exposure through the track;
@@ -32,6 +30,19 @@ export const CAMERA = {
    */
   lockExposure: true,
   exposureTime: null,
+}
+
+/**
+ * DEBUG: on-screen diagnostics and tuning aids. All three default on while the prop is being
+ * tuned and are switched off for the final build.
+ */
+export const DEBUG = {
+  /** Per-frame vision readout: state, distance, pose, face, hand, story. */
+  readout: true,
+  /** Live persona-dust tuning sliders (face / torso / hand / head / figure). */
+  sliders: true,
+  /** Corner thumbnail of the raw (unmirrored) camera feed. */
+  preview: true,
 }
 
 /**
@@ -139,7 +150,12 @@ export const GESTURE = {
   numHands: 2,
   minHandDetectionConfidence: 0.5,
   minHandPresenceConfidence: 0.5,
-  minTrackingConfidence: 0.5,
+  /**
+   * Deliberately low: a hand reaching at the mirror-mounted camera is foreshortened (the palm
+   * is hidden), which keeps tracking confidence hovering around 0.5. At the old 0.5 the model
+   * dropped the hand for a few frames at a time; 0.3 keeps it locked through that uncertainty.
+   */
+  minTrackingConfidence: 0.3,
 }
 
 /**
@@ -199,6 +215,12 @@ export const HAND = {
    * hand would otherwise collapse to a point and flash a dot at the frame edge.
    */
   minSpan: 0.05,
+  /**
+   * EMA time constant (ms) for the hand's bounding box. MediaPipe's per-frame landmarks jitter,
+   * which makes the dust cloud shiver and reads as flicker even while the hand is tracked.
+   * Smoothing the box centre and size settles it without adding noticeable lag.
+   */
+  smoothMs: 80,
 }
 
 /**
@@ -317,6 +339,16 @@ export const PERSONA = {
   /** Opacity ramp time constants (seconds) for appearing and dissolving. */
   appearTau: 0.5,
   disappearTau: 0.7,
+  /** Fast linear fade (seconds) used when the glass shatter dismisses the persona. */
+  shatterFade: 0.12,
+
+  /**
+   * How long the hand's last-good landmarks are held after MediaPipe drops it, in milliseconds.
+   * Hand tracking is the least stable of the three models and drops for 1–3 frames at a time;
+   * without this hold the hand dust blinks off on every dropped frame. Long enough to bridge
+   * those gaps, short enough that a hand genuinely pulled out of frame fades quickly.
+   */
+  handGraceMs: 220,
 
   /**
    * Face dust: a filled point cloud seeded across the face mesh, drifting like the torso dust and
@@ -337,18 +369,139 @@ export const PERSONA = {
    * Figure scale: a uniform multiplier on the whole persona (torso, face, hands and halo) and on
    * the dust point sizes. 1 sizes the figure to the frame; <1 shrinks it, >1 grows it.
    *
-   * Currently set for the landscape monitor (1). A portrait panel needed ~2.5 with 'contain'.
+   * Currently the portrait monitor: `2.5` with 'contain' sizes the figure to the tall panel.
    */
-  scale: 1.4,
+  scale: 2.5,
 
   /**
    * How the normalised camera frame maps onto the mirror frame:
    *   - 'fill' maps x/y straight onto the frame (stretches to fit) — the landscape behaviour;
    *   - 'contain' keeps the camera's aspect, so the figure is never stretched; it fits inside
-   *     the frame and is letterboxed on the long axis. Required for a portrait monitor.
+   *     the frame and is letterboxed on the long axis. Used for the portrait monitor.
    *
-   * Currently the landscape monitor, so 'fill'. Switch to 'contain' (and raise `scale`) when a
-   * portrait panel is back.
+   * Currently the portrait monitor, so 'contain'.
    */
-  aspectFit: 'fill',
+  aspectFit: 'contain',
+}
+
+/**
+ * STORY: the scripted narration + sound sequence that runs on top of the state machine.
+ *
+ * The director (audio/director.js) walks `steps` linearly while the player is present. Each step
+ * names a looping sound-effect bed and an optional one-shot narration clip. Steps 2→4 auto-advance
+ * after each narration clip ends plus `narrationGap`; step 5 is the EXIT climax and waits for the
+ * extend-hand trigger. Asset keys here are the keys exported by `audio/assets.js`.
+ *
+ * The narration is the story's voice, so it must be the loudest layer; the beds sit under it and
+ * the shatter is a single accent.
+ */
+export const STORY = {
+  /** Per-layer gain (0–1). The speech bus is also what feeds the lip-sync analyser. */
+  levels: {
+    narration: 1,
+    bed: 0.4,
+    sfx: 1,
+  },
+  /**
+   * Silence between consecutive narration clips, in seconds. The next act starts only after the
+   * current one has finished and this gap has elapsed, so the voice gets room to breathe.
+   */
+  narrationGap: 2,
+  /** Fade lengths, in seconds. `duck` is the short fade used when the player steps away. */
+  fade: {
+    narration: 0.9,
+    bed: 1.2,
+    runningAway: 0.6,
+    duck: 0.4,
+    /** The step-4 prompt fades in gently so it lands on the line instead of popping on. */
+    prompt: 1.4,
+  },
+  /**
+   * The linear story, one entry per step (index 0 = step 1):
+   *   1 APPROACH — ambient drone
+   *   2 ENTRY    — sub-bass + act_1
+   *   3 ENTRY    — rumble + act_2
+   *   4 ENTRY    — rumble + act_3 + on-screen prompt
+   *   5 EXIT     — rumble continues, quote/crack/title timeline
+   *
+   * `promptAt` is the narration offset (seconds) at which the prompt appears. act_3 says
+   * "...leave this behind."; 3.7 s lands on the word "behind", so the instruction arrives as the
+   * line closes rather than when the track starts.
+   */
+  steps: [
+    { bed: 'approachDrone', narration: null },
+    { bed: 'entrySubBass', narration: 'act1' },
+    { bed: 'lowEndRumble', narration: 'act2' },
+    {
+      bed: 'lowEndRumble',
+      narration: 'act3',
+      prompt: 'Reach out your hand towards the mirror',
+      promptAt: 3.7,
+    },
+    { bed: 'lowEndRumble', narration: null },
+  ],
+  /**
+   * Only this step enables the extend-hand EXIT trigger, so a stray reach during the earlier acts
+   * cannot cut the story short. main.js gates the detector on `director.step === triggerStep`.
+   */
+  triggerStep: 4,
+  /** Played when the player steps back from ENTRY to APPROACH mid-story. */
+  runningAway: 'runningAway',
+  /** Sucked-away sound that dismisses the persona just before the mirror breaks. */
+  suction: 'quickAirSuction',
+  /** Fired at the glass-crack beat of the EXIT climax, after the suction has finished. */
+  shatter: 'glassShatter',
+  /**
+   * EXIT quote/title timeline, in seconds from the EXIT frame:
+   *   - line A fades in at `lineAAt`;
+   *   - line B fades in at `lineBAt`;
+   *   - the air suction plays at `suctionAt`, and the persona stops tracking and fades away;
+   *   - the glass cracks and shatters at `crackAt`, as the suction finishes;
+   *   - both lines fade out from `fadeOutAt`;
+   *   - "ALTER EGO" fades in at `titleAt`, over the crack, which stays lit from `crackAt` on.
+   */
+  quote: {
+    lineA: 'when you stare into the abyss...',
+    lineB: 'the abyss stares into you.',
+    title: 'ALTER EGO',
+    lineAAt: 0.3,
+    lineBAt: 2.6,
+    lineDur: 1.2,
+    suctionAt: 4.4,
+    crackAt: 5.9,
+    fadeOutAt: 6.0,
+    fadeOutDur: 1.2,
+    titleAt: 7.4,
+    titleDur: 2.0,
+  },
+  /**
+   * Lip-sync envelope: narration loudness → jaw opening. `attack`/`release` are the follower's
+   * time constants, so the mouth opens quickly on a syllable and eases shut between words.
+   */
+  mouth: {
+    attack: 0.1,
+    release: 0.22,
+    gain: 3.2,
+    max: 1,
+  },
+}
+
+/**
+ * GLASS: the screen-space crack effect fired on the EXIT climax.
+ *
+ * A procedural spider-web of jittered lines radiates from an impact point, over a sharp white
+ * flash that decays quickly. The lines snap on and stay lit so the mirror reads as broken while
+ * the "ALTER EGO" title resolves in front of them; only a story reset clears them.
+ */
+export const GLASS = {
+  /** Number of radial cracks in the web. */
+  crackCount: 16,
+  /** How far each crack wanders sideways as a fraction of its length (higher = more jagged). */
+  jitter: 0.22,
+  /** Peak opacity of the white flash. */
+  flashPeak: 0.85,
+  /** Flash decay time, in milliseconds. */
+  flashMs: 160,
+  /** Crack-line colour. */
+  color: 0xcfe8ff,
 }
